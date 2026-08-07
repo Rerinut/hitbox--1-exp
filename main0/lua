@@ -1,0 +1,882 @@
+
+getgenv().uiLE = getgenv().uiLE or {}
+if getgenv().uiLE.loading then return end
+getgenv().uiLE.loading = true
+
+-- ============================================================
+-- [NEW] Logger module — единая система логирования с уровнями
+-- ============================================================
+getgenv().uiLE.Logger = getgenv().uiLE.Logger or (function()
+    local L = {}
+    L.enabled = true
+    L.level = "warn" -- "info" | "warn" | "error" | "silent"
+    local levelOrder = { info = 1, warn = 2, error = 3, silent = 4 }
+
+    local function shouldLog(msgLevel)
+        if not L.enabled then return false end
+        return levelOrder[msgLevel] >= levelOrder[L.level]
+    end
+
+    local function fmt(tag, msg)
+        return string.format("[AXIOS][%s] %s", tag, tostring(msg))
+    end
+
+    L.info = function(msg)
+        if shouldLog("info") then print(fmt("INFO", msg)) end
+    end
+    L.warn = function(msg)
+        if shouldLog("warn") then warn(fmt("WARN", msg)) end
+    end
+    L.error = function(msg)
+        if shouldLog("error") then warn(fmt("ERROR", msg)) end
+    end
+    L.setLevel = function(lvl)
+        if levelOrder[lvl] then L.level = lvl end
+    end
+    L.setEnabled = function(v)
+        L.enabled = v and true or false
+    end
+    return L
+end)()
+local Logger = getgenv().uiLE.Logger
+
+-- ==================================================================
+-- [NEW] ConnectionManager — централизованное хранение и очистка
+-- RBXScriptConnection по категориям, чтобы избежать утечек при
+-- повторных вызовах Initialize*/BuildUI
+-- ==================================================================
+getgenv().uiLE.Connections = getgenv().uiLE.Connections or (function()
+    local C = {}
+    local store = {}
+
+    C.track = function(category, conn)
+        if not conn then return conn end
+        store[category] = store[category] or {}
+        table.insert(store[category], conn)
+        return conn
+    end
+
+    C.disconnectCategory = function(category)
+        local list = store[category]
+        if not list then return end
+        for _, conn in ipairs(list) do
+            pcall(function() conn:Disconnect() end)
+        end
+        store[category] = {}
+    end
+
+    C.disconnectAll = function()
+        for category in pairs(store) do
+            C.disconnectCategory(category)
+        end
+    end
+
+    return C
+end)()
+local Connections = getgenv().uiLE.Connections
+
+-- ============================================================
+-- [NEW] Debounce utility — сглаживание спамящих событий
+-- ============================================================
+local function debounce(fn, delay)
+    local pending = false
+    return function()
+        if pending then return end
+        pending = true
+        task.delay(delay, function()
+            pending = false
+            fn()
+        end)
+    end
+end
+
+local function fetchUrlList(urls)
+    for _, url in ipairs(urls) do
+        local ok, result = pcall(function() return game:HttpGet(url) end)
+        if ok and result and result ~= "" then
+            Logger.info("Fetched: " .. tostring(url)) -- [FIX] логирование
+            return result
+        else
+            Logger.warn("Failed to fetch (" .. tostring(url) .. "): " .. tostring(result)) -- [FIX]
+        end
+    end
+    return nil
+end
+
+local function tryLoadFromURL(url)
+    local content = fetchUrlList({url})
+    if not content then return nil end
+    local func, err = loadstring(content)
+    if not func then
+        Logger.warn("loadstring error for " .. tostring(url) .. ": " .. tostring(err)) -- [FIX]
+        return nil
+    end
+    local ok, result = pcall(func)
+    if not ok then
+        Logger.warn("Execution error for " .. tostring(url) .. ": " .. tostring(result)) -- [FIX]
+        return nil
+    end
+    return result
+end
+
+local function safeLoadString(urls)
+    for _, url in ipairs(urls) do
+        local result = tryLoadFromURL(url)
+        if result then return result end
+    end
+    Logger.error("All sources failed for URL list: " .. table.concat(urls, ", ")) -- [FIX]
+    return nil
+end
+
+-- ==================================================================
+-- [NEW] fetchAndCacheScript — загрузка скрипта с сети + локальный
+-- кэш-фоллбэк на случай, если GitHub/Rubis недоступны
+-- ==================================================================
+local function fetchAndCacheScript(urls, cacheFile)
+    for _, url in ipairs(urls) do
+        local content = fetchUrlList({url})
+        if content and content ~= "" then
+            if writefile then
+                local okw = pcall(function() writefile(cacheFile, content) end)
+                if okw then Logger.info("Cached script to " .. cacheFile) end
+            end
+            local func, err = loadstring(content)
+            if func then
+                local ok, result = pcall(func)
+                if ok then
+                    return result
+                else
+                    Logger.warn("Execution failed for " .. url .. ": " .. tostring(result))
+                end
+            else
+                Logger.warn("loadstring failed for " .. url .. ": " .. tostring(err))
+            end
+        end
+    end
+
+    if isfile and readfile and isfile(cacheFile) then
+        local okr, cached = pcall(readfile, cacheFile)
+        if okr and cached and cached ~= "" then
+            local func = loadstring(cached)
+            if func then
+                local ok2, result = pcall(func)
+                if ok2 then
+                    Logger.warn("Loaded from local cache (offline fallback): " .. cacheFile)
+                    return result
+                end
+            end
+        end
+    end
+
+    Logger.error("Failed to load script from network and cache: " .. cacheFile)
+    return nil
+end
+
+local limbExtenderURLs = {
+    "https://raw.githubusercontent.com/AAPVdev/scripts/refs/heads/main/LimbExtender.lua",
+    "https://api.rubis.app/v2/scrap/DkwppyJ0KaQvou0r/raw"
+}
+-- [FIX] используем кэширующую загрузку вместо простого safeLoadString
+getgenv().uiLE.le = getgenv().uiLE.le or fetchAndCacheScript(limbExtenderURLs, "AXIOS_LE_Cache.lua")
+if not getgenv().uiLE.le then getgenv().uiLE.loading = false; return end
+
+if getgenv().uiLE.gcontroller then
+    getgenv().uiLE.gcontroller:Destroy()
+    getgenv().uiLE.gcontroller = nil
+end
+getgenv().uiLE.gcontroller = getgenv().uiLE.le.new()
+local ctrl = getgenv().uiLE.gcontroller
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local UserInputService = game:GetService("UserInputService")
+local isPC = UserInputService:GetPlatform() == Enum.Platform.Windows or UserInputService:GetPlatform() == Enum.Platform.OSX
+
+-- ==================================================================
+-- [NEW] safeGet/safeSet — pcall-обёртки над ctrl:Get/ctrl:Set,
+-- чтобы ошибка в контроллере не роняла весь скрипт/UI
+-- ==================================================================
+local function safeGet(flag)
+    local ok, val = pcall(function() return ctrl:Get(flag) end)
+    if ok then return val end
+    Logger.warn("ctrl:Get failed for flag '" .. tostring(flag) .. "': " .. tostring(val))
+    return nil
+end
+
+local function safeSet(flag, value)
+    local ok, err = pcall(function() ctrl:Set(flag, value) end)
+    if not ok then
+        Logger.warn("ctrl:Set failed for flag '" .. tostring(flag) .. "': " .. tostring(err))
+    end
+end
+
+-- [FIX] инициализация уровня логирования по сохранённому флагу
+Logger.setLevel(safeGet("DEBUG_LOGGING") and "info" or "warn")
+
+local function getLodFlag(key, field)
+    local t = safeGet(key) -- [FIX] safeGet вместо ctrl:Get
+    return type(t) == "table" and t[field]
+end
+
+local function setLodFlag(key, field, value)
+    local t = safeGet(key) -- [FIX]
+    if type(t) ~= "table" then t = {} end
+    t[field] = value
+    safeSet(key, t) -- [FIX]
+end
+
+getgenv().uiLE.targetLimbDropdown = nil
+getgenv().uiLE.whitelistTeamsDropdown = nil
+getgenv().uiLE.blacklistTeamsDropdown = nil
+getgenv().uiLE.whitelistPlayersDropdown = nil
+getgenv().uiLE.blacklistPlayersDropdown = nil
+
+-- [NEW] реестр всех известных флагов — нужен для Export/Import конфига
+getgenv().uiLE.knownFlags = getgenv().uiLE.knownFlags or {}
+
+local scannedLimbs = {}
+local limbPriority = {
+    "Head","HumanoidRootPart","UpperTorso","LowerTorso","Torso",
+    "LeftUpperArm","LeftLowerArm","LeftHand","RightUpperArm","RightLowerArm","RightHand",
+    "Left Arm","Right Arm",
+    "LeftUpperLeg","LeftLowerLeg","LeftFoot","RightUpperLeg","RightLowerLeg","RightFoot",
+    "Left Leg","Right Leg",
+}
+
+local function getLimbPriority(name)
+    local lower = name:lower()
+    for index, limb in ipairs(limbPriority) do
+        if lower:find(limb:lower(), 1, true) then return index end
+    end
+    return math.huge
+end
+
+local function sortLimbs()
+    table.sort(scannedLimbs, function(a, b)
+        local pa = getLimbPriority(a)
+        local pb = getLimbPriority(b)
+        if pa ~= pb then return pa < pb end
+        return a:lower() < b:lower()
+    end)
+end
+
+-- [NEW] debounced-обновление дропдауна лимбов — не пересортировываем
+-- список при каждом добавленном BasePart, а батчим за 0.1с
+local scheduleLimbRefresh = debounce(function()
+    sortLimbs()
+    if getgenv().uiLE.targetLimbDropdown then
+        getgenv().uiLE.targetLimbDropdown:Refresh(scannedLimbs)
+    end
+end, 0.1)
+
+local function registerLimb(name)
+    if not name or table.find(scannedLimbs, name) then return end
+    table.insert(scannedLimbs, name)
+    scheduleLimbRefresh() -- [FIX] было: sortLimbs() + Refresh() на каждый вызов
+end
+
+local function getPartPath(part, character)
+    local path = part.Name
+    local parent = part.Parent
+    while parent and parent ~= character do
+        path = parent.Name .. "." .. path
+        parent = parent.Parent
+    end
+    return path
+end
+
+local function scanCharacter(character)
+    if not character then return end
+    table.clear(scannedLimbs)
+    for _, desc in ipairs(character:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            registerLimb(getPartPath(desc, character))
+        end
+    end
+end
+
+-- ==================================================================
+-- [FIX] InitializeLimbScanning — теперь использует ConnectionManager,
+-- чтобы не плодить дублирующиеся DescendantAdded-подключения
+-- при повторных вызовах / респавнах персонажа
+-- ==================================================================
+local function InitializeLimbScanning()
+    Connections.disconnectCategory("LimbScan")
+    Connections.disconnectCategory("LimbScan_Descendants")
+
+    local function bindCharacter(character)
+        scanCharacter(character)
+        Connections.disconnectCategory("LimbScan_Descendants")
+        Connections.track("LimbScan_Descendants", character.DescendantAdded:Connect(function(desc)
+            if desc:IsA("BasePart") then registerLimb(getPartPath(desc, character)) end
+        end))
+    end
+
+    Connections.track("LimbScan", LocalPlayer.CharacterAdded:Connect(function(character)
+        bindCharacter(character)
+    end))
+
+    if LocalPlayer.Character then
+        bindCharacter(LocalPlayer.Character)
+    end
+end
+
+local scannedTeams = {}
+
+local function sortTeams()
+    table.sort(scannedTeams, function(a, b) return a:lower() < b:lower() end)
+end
+
+-- [NEW] debounced-обновление командных дропдаунов
+local scheduleTeamRefresh = debounce(function()
+    sortTeams()
+    if getgenv().uiLE.whitelistTeamsDropdown then
+        getgenv().uiLE.whitelistTeamsDropdown:Refresh(scannedTeams)
+    end
+    if getgenv().uiLE.blacklistTeamsDropdown then
+        getgenv().uiLE.blacklistTeamsDropdown:Refresh(scannedTeams)
+    end
+end, 0.1)
+
+local function registerTeam(name)
+    if not name or table.find(scannedTeams, name) then return end
+    table.insert(scannedTeams, name)
+    scheduleTeamRefresh() -- [FIX]
+end
+
+local function unregisterTeam(name)
+    local idx = table.find(scannedTeams, name)
+    if idx then
+        table.remove(scannedTeams, idx)
+        scheduleTeamRefresh() -- [FIX]
+    end
+end
+
+local function scanTeams()
+    table.clear(scannedTeams)
+    local teamsService = game:GetService("Teams")
+    for _, team in ipairs(teamsService:GetChildren()) do
+        if team:IsA("Team") then
+            registerTeam(team.Name)
+        end
+    end
+end
+
+-- ==================================================================
+-- [FIX] InitializeTeamScanning — обе подписки (ChildAdded/ChildRemoved)
+-- теперь трекаются и отключаются через ConnectionManager
+-- ==================================================================
+local function InitializeTeamScanning()
+    Connections.disconnectCategory("TeamScan")
+    local teamsService = game:GetService("Teams")
+    scanTeams()
+    Connections.track("TeamScan", teamsService.ChildAdded:Connect(function(child)
+        if child:IsA("Team") then registerTeam(child.Name) end
+    end))
+    Connections.track("TeamScan", teamsService.ChildRemoved:Connect(function(child)
+        if child:IsA("Team") then unregisterTeam(child.Name) end
+    end))
+end
+
+local scannedPlayers = {}
+local nameToUserId = {}
+local userIdToName = {}
+
+local function sortPlayers()
+    table.sort(scannedPlayers, function(a, b) return a:lower() < b:lower() end)
+end
+
+-- [NEW] debounced-обновление игровых дропдаунов
+local schedulePlayerRefresh = debounce(function()
+    sortPlayers()
+    if getgenv().uiLE.whitelistPlayersDropdown then
+        getgenv().uiLE.whitelistPlayersDropdown:Refresh(scannedPlayers)
+    end
+    if getgenv().uiLE.blacklistPlayersDropdown then
+        getgenv().uiLE.blacklistPlayersDropdown:Refresh(scannedPlayers)
+    end
+end, 0.1)
+
+local function registerPlayer(player)
+    if not player or not player:IsA("Player") then return end
+    local name = player.Name
+    if table.find(scannedPlayers, name) then return end
+    table.insert(scannedPlayers, name)
+    nameToUserId[name] = player.UserId
+    userIdToName[player.UserId] = name
+    schedulePlayerRefresh() -- [FIX]
+end
+
+local function unregisterPlayer(player)
+    if not player or not player:IsA("Player") then return end
+    local name = player.Name
+    local idx = table.find(scannedPlayers, name)
+    if idx then
+        table.remove(scannedPlayers, idx)
+        nameToUserId[name] = nil
+        userIdToName[player.UserId] = nil
+        schedulePlayerRefresh() -- [FIX]
+    end
+end
+
+local function scanPlayers()
+    table.clear(scannedPlayers)
+    table.clear(nameToUserId)
+    table.clear(userIdToName)
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            registerPlayer(player)
+        end
+    end
+end
+
+-- ==================================================================
+-- [FIX] InitializePlayerScanning — через ConnectionManager
+-- ==================================================================
+local function InitializePlayerScanning()
+    Connections.disconnectCategory("PlayerScan")
+    scanPlayers()
+    Connections.track("PlayerScan", Players.PlayerAdded:Connect(function(player)
+        if player ~= LocalPlayer then registerPlayer(player) end
+    end))
+    Connections.track("PlayerScan", Players.PlayerRemoving:Connect(function(player)
+        unregisterPlayer(player)
+    end))
+end
+
+local function userIdArrayToNames(userIdArray)
+    if type(userIdArray) ~= "table" then return {} end
+    local names = {}
+    for _, uid in ipairs(userIdArray) do
+        local name = userIdToName[uid]
+        if name then table.insert(names, name) end
+    end
+    return names
+end
+
+local function normalizeVersion(s)
+    if not s then return nil end
+    return tostring(s):gsub("^%s+", ""):gsub("%s+$", ""):gsub("^v", "")
+end
+
+local CONFIG_FILE = "AXIOS_Config.json"
+local HttpService = game:GetService("HttpService")
+
+local function loadConfig()
+    if not (isfile and readfile) then return {} end
+    if not isfile(CONFIG_FILE) then return {} end
+    local ok, data = pcall(function() return readfile(CONFIG_FILE) end)
+    if not ok or not data then return {} end
+    local ok2, tbl = pcall(function() return HttpService:JSONDecode(data) end)
+    if ok2 and type(tbl) == "table" then return tbl end
+    return {}
+end
+
+local function saveConfig(tbl)
+    if not (writefile and type(tbl) == "table") then return false end
+    local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
+    if not ok then return false end
+    local ok2 = pcall(function() writefile(CONFIG_FILE, json) end)
+    return ok2
+end
+
+local function persist_seen_version(ver)
+    if not ver then return end
+    local norm = normalizeVersion(ver)
+    local cfg = loadConfig()
+    cfg.lastSeenVersion = norm
+    saveConfig(cfg)
+end
+
+local function load_seen_from_file()
+    local cfg = loadConfig()
+    return normalizeVersion(cfg.lastSeenVersion)
+end
+
+local function saveUIVersion(version)
+    local cfg = loadConfig()
+    cfg.uiVersion = version
+    saveConfig(cfg)
+end
+
+local function loadUIVersion()
+    local cfg = loadConfig()
+    if cfg.uiVersion == 1 or cfg.uiVersion == 2 then
+        return cfg.uiVersion
+    end
+    return 2
+end
+
+getgenv().ChangelogHelper = getgenv().ChangelogHelper or (function()
+    local M = {}
+    local changelogs = {}
+    local tabHandle
+
+    local function buildBoxes(sections)
+        local boxes = {}
+        for _, sec in ipairs(sections or {}) do
+            local desc = ""
+            for i, it in ipairs(sec.items or {}) do
+                desc = desc .. "• " .. it .. (i < #sec.items and "\n" or "")
+            end
+            table.insert(boxes, { title = sec.title, description = desc })
+        end
+        return boxes
+    end
+
+    local function showPopup(window, entry)
+        if not window or not entry then return end
+        local content = nil
+        if entry.highlights and #entry.highlights > 0 then content = "Highlights:\n" .. table.concat(entry.highlights, "\n• ") end
+        local popup = {
+            title = entry.version or "Changelog",
+            subtitle = entry.date,
+            content = content,
+            boxes = buildBoxes(entry.sections),
+            options = {
+                { text = "Close", style = "primary" },
+                { text = "Copy notes", style = "neutral", callback = function()
+                    if setclipboard then
+                        local md = "# " .. (entry.version or "Changelog") .. "\n"
+                        if entry.date then md = md .. "_"..entry.date.."_\n\n" end
+                        if entry.highlights then
+                            md = md .. "## Highlights\n"
+                            for _, h in ipairs(entry.highlights) do md = md .. "- " .. h .. "\n" end
+                            md = md .. "\n"
+                        end
+                        for _, s in ipairs(entry.sections or {}) do
+                            md = md .. "## " .. s.title .. "\n"
+                            for _, it in ipairs(s.items or {}) do md = md .. "- " .. it .. "\n" end
+                            md = md .. "\n"
+                        end
+                        setclipboard(md)
+                    end
+                end },
+            },
+            dismissable = true,
+        }
+        local ok = pcall(function() window:Popup(popup) end) -- [FIX] pcall-обёртка
+        if not ok then Logger.warn("Failed to show changelog popup") end
+    end
+
+    local function createTab(window)
+        if tabHandle then return tabHandle end
+        if not window then return nil end
+        local t = window:CreateTab({ name = "Changelog" })
+        t:CreateSection({ name = "Releases" })
+        for i, entry in ipairs(changelogs) do
+            local title = entry.version or ("Release " .. i)
+            local descr = entry.date or ""
+            t:CreateButton({
+                name = title,
+                description = descr,
+                callback = function()
+                    showPopup(window, entry)
+                    persist_seen_version(entry.version)
+                end,
+            })
+        end
+        tabHandle = t
+        return t
+    end
+
+    M.add = function(entry)
+        table.insert(changelogs, 1, entry or {})
+        tabHandle = nil
+    end
+
+    M.reset = function()
+        table.clear(changelogs)
+        tabHandle = nil
+    end
+
+    M.register = function(window, opts)
+        createTab(window)
+        opts = opts or {}
+        local latestRaw = changelogs[1] and changelogs[1].version
+        if not latestRaw then return end
+        local latest = normalizeVersion(latestRaw)
+        local seen = load_seen_from_file()
+        local wantPopups = window:Get("Changelog.ShowPopups")
+        if wantPopups == nil then wantPopups = true end
+
+        local function parseFullSemver(v)
+            if not v then return nil end
+            local major, minor, patch = v:match("^(%d+)%.(%d+)%.?(%d*)$")
+            return tonumber(major), tonumber(minor), tonumber(patch) or 0
+        end
+
+        local function significant(oldV, newV)
+            if not newV then return false end
+            if not oldV then return true end
+            local o1,o2 = parseFullSemver(oldV) 
+            local n1,n2 = parseFullSemver(newV) 
+            if not (o1 and n1) then return true end
+            if n1 > o1 then return true end
+            if (n2 and o2) and n2 > o2 then return true end
+            return false
+        end
+
+        if seen == latest then return end
+
+        local entryToShow
+        if seen == nil then
+            local latestMajor, latestMinor, latestPatch = parseFullSemver(latest)
+            for i, entry in ipairs(changelogs) do
+                local major, minor, patch = parseFullSemver(entry.version)
+                if major == latestMajor and minor == latestMinor and patch == 0 then
+                    entryToShow = entry
+                    break
+                end
+            end
+            entryToShow = entryToShow or changelogs[1]
+        else
+            entryToShow = changelogs[1]
+        end
+
+        if entryToShow then
+            if significant(seen, entryToShow.version) and wantPopups and opts.showPopupOnUpdate ~= false then
+                local shouldNotify = true
+                if entryToShow.notify ~= nil then shouldNotify = entryToShow.notify end
+                if shouldNotify then
+                    pcall(function() window:Toast({ title = "New update: " .. (entryToShow.version or latest), subtitle = (entryToShow.date or "") }) end) -- [FIX]
+                    task.spawn(function()
+                        task.wait(0.18)
+                        showPopup(window, entryToShow)
+                    end)
+                else
+                    pcall(function() window:Toast({ title = "Updated to " .. (entryToShow.version or latest) }) end) -- [FIX]
+                end
+                persist_seen_version(entryToShow.version)
+            else
+                pcall(function() window:Toast({ title = "Updated: " .. (entryToShow.version or latest) }) end) -- [FIX]
+                persist_seen_version(entryToShow.version)
+            end
+        end
+    end
+
+    M.list = function() return changelogs end
+    return M
+end)()
+
+-- ==================================================================
+-- [FIX] loadRemoteChangelogs — теперь кэширует JSON локально и
+-- умеет работать оффлайн, если GitHub/Rubis недоступны
+-- ==================================================================
+local function loadRemoteChangelogs()
+    local changelogURLs = {
+        "https://raw.githubusercontent.com/AAPVdev/scripts/refs/heads/main/changelogs.json",
+        "https://api.rubis.app/v2/scrap/5olUvAKK803Tl2js/raw"
+    }
+    local cacheFile = "AXIOS_Changelog_Cache.json"
+
+    for _, url in ipairs(changelogURLs) do
+        local content = fetchUrlList({url})
+        if content then
+            local success, data = pcall(function() return game:GetService("HttpService"):JSONDecode(content) end)
+            if success and type(data) == "table" then
+                if writefile then
+                    pcall(function() writefile(cacheFile, content) end)
+                end
+                for i = #data, 1, -1 do
+                    getgenv().ChangelogHelper.add(data[i])
+                end
+                return true
+            else
+                Logger.warn("Failed to decode changelog JSON from " .. url)
+            end
+        end
+    end
+
+    if isfile and readfile and isfile(cacheFile) then
+        local okr, cached = pcall(readfile, cacheFile)
+        if okr and cached and cached ~= "" then
+            local ok2, data = pcall(function() return game:GetService("HttpService"):JSONDecode(cached) end)
+            if ok2 and type(data) == "table" then
+                Logger.warn("Loaded changelogs from local cache (offline fallback)")
+                for i = #data, 1, -1 do
+                    getgenv().ChangelogHelper.add(data[i])
+                end
+                return true
+            end
+        end
+    end
+
+    Logger.error("Failed to load changelogs from network and cache")
+    return false
+end
+
+-- ==================================================================
+-- [NEW] Watermark — плавающий индикатор FPS/Ping/статуса
+-- ==================================================================
+local function initWatermark()
+    local RunService = game:GetService("RunService")
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "AXIOS_Watermark"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999
+
+    local parentGui = (gethui and gethui()) or game:GetService("CoreGui")
+    local okParent = pcall(function() gui.Parent = parentGui end)
+    if not okParent then
+        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 280, 0, 24)
+    label.Position = UDim2.new(0, 8, 0, 8)
+    label.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    label.BackgroundTransparency = 0.25
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.Code
+    label.TextSize = 14
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Text = "AXIOS"
+    label.Visible = false
+    label.Parent = gui
+
+    getgenv().uiLE.WatermarkGui = gui
+    getgenv().uiLE.WatermarkLabel = label
+
+    local acc = 0
+    Connections.track("Watermark", RunService.Heartbeat:Connect(function(dt)
+        if not label.Visible then return end
+        acc = acc + dt
+        if acc < 0.2 then return end
+        acc = 0
+
+        local fps = math.floor(1 / math.max(dt, 1e-4))
+        local ping = 0
+        local okp, val = pcall(function()
+            return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
+        end)
+        if okp and val then ping = math.floor(val) end
+
+        local status = safeGet("ModifyLimbs") and "ON" or "OFF"
+        label.Text = string.format("AXIOS | FPS: %d | Ping: %dms | Limbs: %s", fps, ping, status)
+    end))
+end
+
+local function BuildUI(version)
+    local oldActive = getgenv().uiLE.ActiveUI
+    if oldActive then
+        local w = oldActive.Window
+        local v = oldActive.version
+        if v == 1 then
+            getgenv().uiLE.uilibray:Destroy()
+        elseif v == 2 then
+            w:Unload()
+        end
+        getgenv().uiLE.ActiveUI = nil
+    end
+
+    saveUIVersion(version)
+    getgenv().uiLE.uiVersion = version
+
+    getgenv().RAYFIELD_SECURE = true
+    getgenv().RAYFIELD_ASSET_ID = 84895246331982
+
+    local libURL = version == 1 and "https://sirius.menu/rayfield" or "https://sirius.menu/gen2"
+    -- [FIX] загрузка библиотеки UI с кэш-фоллбэком
+    local uiCacheFile = version == 1 and "AXIOS_UI_Cache_Gen1.lua" or "AXIOS_UI_Cache_Gen2.lua"
+    getgenv().uiLE.uilibray = fetchAndCacheScript({libURL}, uiCacheFile)
+    if not getgenv().uiLE.uilibray then getgenv().uiLE.loading = false; return end
+
+    local Rayfield = getgenv().uiLE.uilibray
+
+    local LOADING_SUBTITLES = {
+        "multiply by delta",
+        "working for the cia",
+        "shoutout serene fr",
+        "avis was here",
+        "seizure causing soap?",
+        "skids skid from skids"
+    }
+
+    local Window
+    if version == 1 then
+        Window = Rayfield:CreateWindow({
+            Name = "AXIOS",
+            ScriptID = "sid_k2rgzy25rkgy",
+            LoadingTitle = "AXIOS",
+            LoadingSubtitle = LOADING_SUBTITLES[math.random(#LOADING_SUBTITLES)],
+            Theme = "Default",
+            DisableRayfieldPrompts = true,
+            ConfigurationSaving = {
+                Enabled = true,
+                FolderName = "LimbExtenderConfigs",
+                FileName = "Configuration",
+            },
+        })
+    else
+        Window = Rayfield:CreateWindow({
+            name = "AXIOS",
+            subtitle = LOADING_SUBTITLES[math.random(#LOADING_SUBTITLES)],
+            theme = "default",
+            configuration = {
+                autoSave = true,
+                autoLoad = true,
+                fileName = "Configuration",
+                customFolder = "LimbExtenderConfigs",
+            },
+        })
+        getgenv().uiLE.uilibray.Window = Window
+    end
+
+    getgenv().uiLE.ActiveUI = {Window = Window, version = version}
+
+    -- [NEW] safeSection — ошибка в одной секции не валит остальной UI
+    local function safeSection(name, fn)
+        local ok, err = pcall(fn)
+        if not ok then
+            Logger.error("UI section '" .. name .. "' failed: " .. tostring(err))
+        end
+    end
+
+    local function createSection(tab, title)
+        if version == 1 then tab:CreateSection(title) else tab:CreateSection({ name = title }) end
+    end
+
+    local function createToggle(tab, name, flag, default, customCallback)
+        default = default or false
+        getgenv().uiLE.knownFlags[flag] = true -- [NEW] регистрация флага
+        local saved = safeGet(flag) -- [FIX]
+        local value = saved ~= nil and saved or default
+        local callbackFn = customCallback or function(v) safeSet(flag, v) end
+        if version == 1 then
+            return tab:CreateToggle({
+                Name = name, Flag = flag, CurrentValue = value,
+                Callback = function(v)
+                    callbackFn(v)
+                    safeSet(flag, v) -- [FIX]
+                end,
+            })
+        else
+            return tab:CreateToggle({
+                name = name, flag = flag, value = value,
+                callback = function(v)
+                    callbackFn(v)
+                    safeSet(flag, v) -- [FIX]
+                end,
+            })
+        end
+    end
+
+    local function createSlider(tab, name, flag, range, increment, suffix, default)
+        default = default or range[1]
+        getgenv().uiLE.knownFlags[flag] = true -- [NEW]
+        local saved = safeGet(flag) -- [FIX]
+        local value = saved ~= nil and saved or default
+        if version == 1 then
+            return tab:CreateSlider({
+                Name = name, Flag = flag, CurrentValue = value,
+                Range = range, Increment = increment, Suffix = suffix or "",
+                Callback = function(v) safeSet(flag, v) end, -- [FIX]
+            })
+        else
+            return tab:CreateSlider({
+                name = name, flag = flag, value = value,
+                range = range, increment = increment, suffix = suffix or "",
+                callback = function(v) safeSet(flag, v) end, -- [FIX]
