@@ -1,4 +1,4 @@
--- Standalone LocalScript (С детальным статусом на экране)
+-- Standalone LocalScript (Сбалансированные повторы и удары)
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
@@ -21,6 +21,10 @@ local PIPE_POSITIONS = {
 -- Координаты дополнительного оборудования
 local GENERATOR_POS = Vector3.new(-1714.53, 133.61, 3343.56)
 local COMMUNIC_POS = Vector3.new(-2708.10, 231.62, 3462.68)
+
+-- НАСТРОЙКИ ПОВТОРОВ
+local TELEPORT_ATTEMPTS = 3
+local TELEPORT_PAUSE = 0.4
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -172,141 +176,26 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Функция контролируемого телепорта с выводом стадий
-local function controlledTeleport(targetPos, myRunId)
-	local char, hum, hrp = getCharacterComponents()
-	if not hrp then return false end
-	
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
-	
-	-- Даем полсекунды на прогрузку на точке
-	task.wait(0.5)
-	if currentRunId ~= myRunId then return false end
-	
-	local _, _, currentHrp = getCharacterComponents()
-	if currentHrp then
-		currentHrp.CFrame = CFrame.new(currentHrp.Position, targetPos)
-	end
-	
-	return true
-end
-
--- Обработка трубы с понятными паузами
+-- Функция телепорта с повторами (держать позицию)
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
-	statusLabel.Text = "Шаг 1: ТП к " .. pipeData.name
-	local success = controlledTeleport(pipeData.pos, myRunId)
-	if not success then return false end
-	
 	local char, hum, hrp = getCharacterComponents()
-	if not char then return false end
+	if not hrp then return false end
 	
-	statusLabel.Text = "Шаг 2: Достаем инструмент..."
-	local equippedTool = char:FindFirstChildOfClass("Tool")
-	if not equippedTool then
-		local backpack = player:FindFirstChild("Backpack")
-		if backpack then
-			equippedTool = backpack:FindFirstChildOfClass("Tool")
-			if equippedTool and hum then
-				hum:EquipTool(equippedTool)
-				task.wait(0.4)
-			end
-		end
+	statusLabel.Text = "ТП (удержание): " .. pipeData.name
+	
+	-- Несколько попыток фиксации на точке
+	for attempt = 1, TELEPORT_ATTEMPTS do
+		if currentRunId ~= myRunId then return false end
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
+		task.wait(TELEPORT_PAUSE)
 	end
 	
-	statusLabel.Text = "Шаг 3: Наносим удары по " .. pipeData.name
-	if equippedTool and currentRunId == myRunId then
-		for i = 1, 4 do
-			if currentRunId ~= myRunId then return false end
-			statusLabel.Text = "Удар " .. i .. " из 4 по " .. pipeData.name
-			pcall(function() equippedTool:Activate() end)
-			task.wait(0.45) -- Уверенная пауза между ударами, чтобы вы увидели урон
-		end
-	end
+	local _, _, currentHrp = getCharacterComponents()
+	if not currentHrp then return false end
 	
-	statusLabel.Text = "Готово: " .. pipeData.name
-	return true
-end
-
-local function runWorkflow(targetPipeIndex)
-	currentRunId += 1
-	local myRunId = currentRunId
-	
-	task.spawn(function()
-		if targetPipeIndex then
-			selectedPipeIndex = targetPipeIndex
-			processSinglePipe(PIPE_POSITIONS[targetPipeIndex], myRunId)
-		else
-			for i, pipeData in ipairs(PIPE_POSITIONS) do
-				if currentRunId ~= myRunId then break end
-				selectedPipeIndex = i
-				local ok = processSinglePipe(pipeData, myRunId)
-				if not ok then break end
-				
-				statusLabel.Text = "Пауза перед следующей трубой..."
-				task.wait(0.8) -- Пауза между трубами, чтобы вы успели заметить переход
-			end
-			if currentRunId == myRunId then
-				statusLabel.Text = "Все трубы пройдены!"
-			end
-		end
-	end)
-end
-
-local function teleportToLocation(targetPos, locationName)
-	currentRunId += 1
-	local myRunId = currentRunId
-	
-	task.spawn(function()
-		statusLabel.Text = "ТП к: " .. locationName
-		controlledTeleport(targetPos, myRunId)
-		if currentRunId == myRunId then
-			statusLabel.Text = "Прибыли: " .. locationName
-		end
-	end)
-end
-
--- Кнопки списка
-for i, pipeData in ipairs(PIPE_POSITIONS) do
-	local pBtn = Instance.new("TextButton")
-	pBtn.Size = UDim2.new(1, -10, 0, 30)
-	pBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-	pBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-	pBtn.Text = pipeData.name
-	pBtn.Font = Enum.Font.SourceSans
-	pBtn.TextSize = 13
-	pBtn.Parent = scrollList
-	Instance.new("UICorner", pBtn).CornerRadius = UDim.new(0, 4)
-	
-	pBtn.MouseButton1Click:Connect(function()
-		runWorkflow(i)
-	end)
-end
-
-minimizeBtn.MouseButton1Click:Connect(function()
-	mainFrame.Visible = false
-	selectFrame.Visible = false
-	openBtn.Visible = true
-end)
-
-openBtn.MouseButton1Click:Connect(function()
-	mainFrame.Visible = true
-	openBtn.Visible = false
-end)
-
-btnSelect.MouseButton1Click:Connect(function()
-	selectFrame.Visible = not selectFrame.Visible
-end)
-
-btnGenerator.MouseButton1Click:Connect(function()
-	teleportToLocation(GENERATOR_POS, "Внешний генератор")
-end)
-
-btnCommunic.MouseButton1Click:Connect(function()
-	teleportToLocation(COMMUNIC_POS, "Коммуникации")
-end)
-
-btnStop.MouseButton1Click:Connect(function()
-	currentRunId += 1
+	statusLabel.Text = "Ожидание / Прицел"
+	task.wait(0.3)
+	if currentRunId ~= myRunId then return false end
