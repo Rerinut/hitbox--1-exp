@@ -1,4 +1,4 @@
--- Standalone LocalScript (Исправлен урон по трубам + Генератор + Коммуникации)
+-- Standalone LocalScript (Стабильный урон + защита от античита)
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
@@ -22,11 +22,7 @@ local PIPE_POSITIONS = {
 local GENERATOR_POS = Vector3.new(-1714.53, 133.61, 3343.56)
 local COMMUNIC_POS = Vector3.new(-2708.10, 231.62, 3462.68)
 
--- НАСТРОЙКИ
-local TELEPORT_ATTEMPTS = 5
-local TELEPORT_PAUSE = 0.8
-local PIPE_DELAY = 1.0
-
+-- НАСТРОЙКИ ДЛЯ СТАБИЛЬНОСТИ УРОНА
 local currentRunId = 0
 local selectedPipeIndex = 1
 
@@ -73,7 +69,7 @@ title.Size = UDim2.new(1, -40, 0, 30)
 title.Position = UDim2.new(0, 10, 0, 5)
 title.BackgroundTransparency = 1
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.Text = "Naramato Manager"
+title.Text = "Naramato Manager (Fix)"
 title.Font = Enum.Font.SourceSansBold
 title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
@@ -89,7 +85,7 @@ minimizeBtn.Font = Enum.Font.SourceSansBold
 minimizeBtn.Parent = mainFrame
 Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0, 4)
 
--- Кнопка: Старт Все трубы
+-- Кнопки интерфейса
 local btnAll = Instance.new("TextButton")
 btnAll.Size = UDim2.new(0.9, 0, 0, 32)
 btnAll.Position = UDim2.new(0.05, 0, 0.13, 0)
@@ -101,7 +97,6 @@ btnAll.TextSize = 14
 btnAll.Parent = mainFrame
 Instance.new("UICorner", btnAll).CornerRadius = UDim.new(0, 4)
 
--- Кнопка: Выбор трубы
 local btnSelect = Instance.new("TextButton")
 btnSelect.Size = UDim2.new(0.9, 0, 0, 32)
 btnSelect.Position = UDim2.new(0.05, 0, 0.26, 0)
@@ -113,7 +108,6 @@ btnSelect.TextSize = 14
 btnSelect.Parent = mainFrame
 Instance.new("UICorner", btnSelect).CornerRadius = UDim.new(0, 4)
 
--- Кнопка: Генератор внешний
 local btnGenerator = Instance.new("TextButton")
 btnGenerator.Size = UDim2.new(0.9, 0, 0, 32)
 btnGenerator.Position = UDim2.new(0.05, 0, 0.39, 0)
@@ -125,7 +119,6 @@ btnGenerator.TextSize = 14
 btnGenerator.Parent = mainFrame
 Instance.new("UICorner", btnGenerator).CornerRadius = UDim.new(0, 4)
 
--- Кнопка: Коммуникации
 local btnCommunic = Instance.new("TextButton")
 btnCommunic.Size = UDim2.new(0.9, 0, 0, 32)
 btnCommunic.Position = UDim2.new(0.05, 0, 0.52, 0)
@@ -137,7 +130,6 @@ btnCommunic.TextSize = 14
 btnCommunic.Parent = mainFrame
 Instance.new("UICorner", btnCommunic).CornerRadius = UDim.new(0, 4)
 
--- Кнопка: Остановить
 local btnStop = Instance.new("TextButton")
 btnStop.Size = UDim2.new(0.9, 0, 0, 32)
 btnStop.Position = UDim2.new(0.05, 0, 0.65, 0)
@@ -181,32 +173,40 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Исправленная логика телепортации и точной регистрации урона
-local function processSinglePipe(pipeData, myRunId)
-	if currentRunId ~= myRunId then return false end
-	
+-- Безопасная и стабильная телепортация (без спама пакетами)
+local function safeTeleport(targetPos, myRunId)
 	local char, hum, hrp = getCharacterComponents()
 	if not hrp then return false end
 	
-	statusLabel.Text = "ТП (удержание): " .. pipeData.name
+	-- Телепортируем ровно 1 раз, гасим скорость
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
 	
-	for attempt = 1, TELEPORT_ATTEMPTS do
-		if currentRunId ~= myRunId then return false end
-		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 2, 0))
-		task.wait(TELEPORT_PAUSE)
-	end
-	
-	local _, _, currentHrp = getCharacterComponents()
-	if not currentHrp then return false end
-	
-	-- Точный разворот прямо на центр трубы (включая высоту Y)
-	currentHrp.CFrame = CFrame.new(currentHrp.Position, pipeData.pos)
-	
-	statusLabel.Text = "Ожидание / Синхронизация"
-	task.wait(0.5) -- Ожидание отклика сервера перед ударом
+	-- Даем серверу 1 секунду на полную синхронизацию позиции
+	task.wait(1.0)
 	if currentRunId ~= myRunId then return false end
 	
+	-- Точный поворот на объект
+	local _, _, currentHrp = getCharacterComponents()
+	if currentHrp then
+		currentHrp.CFrame = CFrame.new(currentHrp.Position, targetPos)
+	end
+	
+	return true
+end
+
+-- Обработка одной трубы с гарантированным прохождением урона
+local function processSinglePipe(pipeData, myRunId)
+	if currentRunId ~= myRunId then return false end
+	
+	statusLabel.Text = "ТП к: " .. pipeData.name
+	local success = safeTeleport(pipeData.pos, myRunId)
+	if not success then return false end
+	
+	local char, hum, hrp = getCharacterComponents()
+	if not char then return false end
+	
+	-- Достаем инструмент
 	local equippedTool = char:FindFirstChildOfClass("Tool")
 	if not equippedTool then
 		local backpack = player:FindFirstChild("Backpack")
@@ -214,21 +214,18 @@ local function processSinglePipe(pipeData, myRunId)
 			equippedTool = backpack:FindFirstChildOfClass("Tool")
 			if equippedTool and hum then
 				hum:EquipTool(equippedTool)
-				task.wait(0.3)
+				task.wait(0.4)
 			end
 		end
 	end
 	
 	statusLabel.Text = "Атака: " .. pipeData.name
-	if equippedTool then
-		for _ = 1, 5 do
+	if equippedTool and currentRunId == myRunId then
+		-- Бьем плавно, чтобы сервер успевал засчитывать каждый удар
+		for _ = 1, 4 do
 			if currentRunId ~= myRunId then return false end
-			-- Поддерживаем точный прицел на трубу во время ударов
-			if currentHrp then
-				currentHrp.CFrame = CFrame.new(currentHrp.Position, pipeData.pos)
-			end
 			pcall(function() equippedTool:Activate() end)
-			task.wait(0.35) -- Увеличенный интервал для корректной регистрации урона сервером
+			task.wait(0.35)
 		end
 	end
 	
@@ -244,14 +241,13 @@ local function runWorkflow(targetPipeIndex)
 		if targetPipeIndex then
 			selectedPipeIndex = targetPipeIndex
 			processSinglePipe(PIPE_POSITIONS[targetPipeIndex], myRunId)
-			statusLabel.Text = "Готово: " .. PIPE_POSITIONS[targetPipeIndex].name
 		else
 			for i, pipeData in ipairs(PIPE_POSITIONS) do
 				if currentRunId ~= myRunId then break end
 				selectedPipeIndex = i
 				local ok = processSinglePipe(pipeData, myRunId)
 				if not ok then break end
-				task.wait(0.5)
+				task.wait(0.85) -- Пауза между трубами для защиты от кика/античита
 			end
 			if currentRunId == myRunId then
 				statusLabel.Text = "Все трубы пройдены!"
@@ -260,40 +256,27 @@ local function runWorkflow(targetPipeIndex)
 	end)
 end
 
--- Функция телепортации к одиночной локации
+-- Телепорт к одиночным точкам
 local function teleportToLocation(targetPos, locationName)
 	currentRunId += 1
 	local myRunId = currentRunId
 	
 	task.spawn(function()
-		local char, hum, hrp = getCharacterComponents()
-		if not hrp then 
-			statusLabel.Text = "Ошибка: нет персонажа"
-			return 
-		end
-		
 		statusLabel.Text = "ТП к: " .. locationName
-		
-		for attempt = 1, TELEPORT_ATTEMPTS do
-			if currentRunId ~= myRunId then return end
-			hrp.AssemblyLinearVelocity = Vector3.zero
-			hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
-			task.wait(TELEPORT_PAUSE)
-		end
-		
+		safeTeleport(targetPos, myRunId)
 		if currentRunId == myRunId then
 			statusLabel.Text = "Готово: " .. locationName
 		end
 	end)
 end
 
--- Кнопки в меню выбора
+-- Кнопки списка
 for i, pipeData in ipairs(PIPE_POSITIONS) do
 	local pBtn = Instance.new("TextButton")
 	pBtn.Size = UDim2.new(1, -10, 0, 30)
 	pBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
 	pBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-	pBtn.Text = pipeData.name
+    pBtn.Text = pipeData.name
 	pBtn.Font = Enum.Font.SourceSans
 	pBtn.TextSize = 13
 	pBtn.Parent = scrollList
@@ -324,7 +307,6 @@ btnGenerator.MouseButton1Click:Connect(function()
 end)
 
 btnCommunic.MouseButton1Click:Connect(function()
-	teleportWindowPos = nil
 	teleportToLocation(COMMUNIC_POS, "Коммуникации")
 end)
 
