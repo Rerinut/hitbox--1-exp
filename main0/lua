@@ -1,882 +1,294 @@
-
-getgenv().uiLE = getgenv().uiLE or {}
-if getgenv().uiLE.loading then return end
-getgenv().uiLE.loading = true
-
--- ============================================================
--- [NEW] Logger module — единая система логирования с уровнями
--- ============================================================
-getgenv().uiLE.Logger = getgenv().uiLE.Logger or (function()
-    local L = {}
-    L.enabled = true
-    L.level = "warn" -- "info" | "warn" | "error" | "silent"
-    local levelOrder = { info = 1, warn = 2, error = 3, silent = 4 }
-
-    local function shouldLog(msgLevel)
-        if not L.enabled then return false end
-        return levelOrder[msgLevel] >= levelOrder[L.level]
-    end
-
-    local function fmt(tag, msg)
-        return string.format("[AXIOS][%s] %s", tag, tostring(msg))
-    end
-
-    L.info = function(msg)
-        if shouldLog("info") then print(fmt("INFO", msg)) end
-    end
-    L.warn = function(msg)
-        if shouldLog("warn") then warn(fmt("WARN", msg)) end
-    end
-    L.error = function(msg)
-        if shouldLog("error") then warn(fmt("ERROR", msg)) end
-    end
-    L.setLevel = function(lvl)
-        if levelOrder[lvl] then L.level = lvl end
-    end
-    L.setEnabled = function(v)
-        L.enabled = v and true or false
-    end
-    return L
-end)()
-local Logger = getgenv().uiLE.Logger
-
--- ==================================================================
--- [NEW] ConnectionManager — централизованное хранение и очистка
--- RBXScriptConnection по категориям, чтобы избежать утечек при
--- повторных вызовах Initialize*/BuildUI
--- ==================================================================
-getgenv().uiLE.Connections = getgenv().uiLE.Connections or (function()
-    local C = {}
-    local store = {}
-
-    C.track = function(category, conn)
-        if not conn then return conn end
-        store[category] = store[category] or {}
-        table.insert(store[category], conn)
-        return conn
-    end
-
-    C.disconnectCategory = function(category)
-        local list = store[category]
-        if not list then return end
-        for _, conn in ipairs(list) do
-            pcall(function() conn:Disconnect() end)
-        end
-        store[category] = {}
-    end
-
-    C.disconnectAll = function()
-        for category in pairs(store) do
-            C.disconnectCategory(category)
-        end
-    end
-
-    return C
-end)()
-local Connections = getgenv().uiLE.Connections
-
--- ============================================================
--- [NEW] Debounce utility — сглаживание спамящих событий
--- ============================================================
-local function debounce(fn, delay)
-    local pending = false
-    return function()
-        if pending then return end
-        pending = true
-        task.delay(delay, function()
-            pending = false
-            fn()
-        end)
-    end
-end
-
-local function fetchUrlList(urls)
-    for _, url in ipairs(urls) do
-        local ok, result = pcall(function() return game:HttpGet(url) end)
-        if ok and result and result ~= "" then
-            Logger.info("Fetched: " .. tostring(url)) -- [FIX] логирование
-            return result
-        else
-            Logger.warn("Failed to fetch (" .. tostring(url) .. "): " .. tostring(result)) -- [FIX]
-        end
-    end
-    return nil
-end
-
-local function tryLoadFromURL(url)
-    local content = fetchUrlList({url})
-    if not content then return nil end
-    local func, err = loadstring(content)
-    if not func then
-        Logger.warn("loadstring error for " .. tostring(url) .. ": " .. tostring(err)) -- [FIX]
-        return nil
-    end
-    local ok, result = pcall(func)
-    if not ok then
-        Logger.warn("Execution error for " .. tostring(url) .. ": " .. tostring(result)) -- [FIX]
-        return nil
-    end
-    return result
-end
-
-local function safeLoadString(urls)
-    for _, url in ipairs(urls) do
-        local result = tryLoadFromURL(url)
-        if result then return result end
-    end
-    Logger.error("All sources failed for URL list: " .. table.concat(urls, ", ")) -- [FIX]
-    return nil
-end
-
--- ==================================================================
--- [NEW] fetchAndCacheScript — загрузка скрипта с сети + локальный
--- кэш-фоллбэк на случай, если GitHub/Rubis недоступны
--- ==================================================================
-local function fetchAndCacheScript(urls, cacheFile)
-    for _, url in ipairs(urls) do
-        local content = fetchUrlList({url})
-        if content and content ~= "" then
-            if writefile then
-                local okw = pcall(function() writefile(cacheFile, content) end)
-                if okw then Logger.info("Cached script to " .. cacheFile) end
-            end
-            local func, err = loadstring(content)
-            if func then
-                local ok, result = pcall(func)
-                if ok then
-                    return result
-                else
-                    Logger.warn("Execution failed for " .. url .. ": " .. tostring(result))
-                end
-            else
-                Logger.warn("loadstring failed for " .. url .. ": " .. tostring(err))
-            end
-        end
-    end
-
-    if isfile and readfile and isfile(cacheFile) then
-        local okr, cached = pcall(readfile, cacheFile)
-        if okr and cached and cached ~= "" then
-            local func = loadstring(cached)
-            if func then
-                local ok2, result = pcall(func)
-                if ok2 then
-                    Logger.warn("Loaded from local cache (offline fallback): " .. cacheFile)
-                    return result
-                end
-            end
-        end
-    end
-
-    Logger.error("Failed to load script from network and cache: " .. cacheFile)
-    return nil
-end
-
-local limbExtenderURLs = {
-    "https://raw.githubusercontent.com/AAPVdev/scripts/refs/heads/main/LimbExtender.lua",
-    "https://api.rubis.app/v2/scrap/DkwppyJ0KaQvou0r/raw"
-}
--- [FIX] используем кэширующую загрузку вместо простого safeLoadString
-getgenv().uiLE.le = getgenv().uiLE.le or fetchAndCacheScript(limbExtenderURLs, "AXIOS_LE_Cache.lua")
-if not getgenv().uiLE.le then getgenv().uiLE.loading = false; return end
-
-if getgenv().uiLE.gcontroller then
-    getgenv().uiLE.gcontroller:Destroy()
-    getgenv().uiLE.gcontroller = nil
-end
-getgenv().uiLE.gcontroller = getgenv().uiLE.le.new()
-local ctrl = getgenv().uiLE.gcontroller
-
+-- Standalone LocalScript (для запуска на стороне клиента)
 local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-local UserInputService = game:GetService("UserInputService")
-local isPC = UserInputService:GetPlatform() == Enum.Platform.Windows or UserInputService:GetPlatform() == Enum.Platform.OSX
+local RunService = game:GetService("RunService")
 
--- ==================================================================
--- [NEW] safeGet/safeSet — pcall-обёртки над ctrl:Get/ctrl:Set,
--- чтобы ошибка в контроллере не роняла весь скрипт/UI
--- ==================================================================
-local function safeGet(flag)
-    local ok, val = pcall(function() return ctrl:Get(flag) end)
-    if ok then return val end
-    Logger.warn("ctrl:Get failed for flag '" .. tostring(flag) .. "': " .. tostring(val))
-    return nil
-end
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
-local function safeSet(flag, value)
-    local ok, err = pcall(function() ctrl:Set(flag, value) end)
-    if not ok then
-        Logger.warn("ctrl:Set failed for flag '" .. tostring(flag) .. "': " .. tostring(err))
-    end
-end
-
--- [FIX] инициализация уровня логирования по сохранённому флагу
-Logger.setLevel(safeGet("DEBUG_LOGGING") and "info" or "warn")
-
-local function getLodFlag(key, field)
-    local t = safeGet(key) -- [FIX] safeGet вместо ctrl:Get
-    return type(t) == "table" and t[field]
-end
-
-local function setLodFlag(key, field, value)
-    local t = safeGet(key) -- [FIX]
-    if type(t) ~= "table" then t = {} end
-    t[field] = value
-    safeSet(key, t) -- [FIX]
-end
-
-getgenv().uiLE.targetLimbDropdown = nil
-getgenv().uiLE.whitelistTeamsDropdown = nil
-getgenv().uiLE.blacklistTeamsDropdown = nil
-getgenv().uiLE.whitelistPlayersDropdown = nil
-getgenv().uiLE.blacklistPlayersDropdown = nil
-
--- [NEW] реестр всех известных флагов — нужен для Export/Import конфига
-getgenv().uiLE.knownFlags = getgenv().uiLE.knownFlags or {}
-
-local scannedLimbs = {}
-local limbPriority = {
-    "Head","HumanoidRootPart","UpperTorso","LowerTorso","Torso",
-    "LeftUpperArm","LeftLowerArm","LeftHand","RightUpperArm","RightLowerArm","RightHand",
-    "Left Arm","Right Arm",
-    "LeftUpperLeg","LeftLowerLeg","LeftFoot","RightUpperLeg","RightLowerLeg","RightFoot",
-    "Left Leg","Right Leg",
+-- 10 Точных координат
+local PIPE_POSITIONS = {
+	{id = 1,  name = "Труба 1",  pos = Vector3.new(-3806.71, 98.50, 5093.26)},
+	{id = 2,  name = "Труба 2",  pos = Vector3.new(-3960.26, 106.50, 5281.30)},
+	{id = 3,  name = "Труба 3",  pos = Vector3.new(-3671.71, 93.50, 5389.35)},
+	{id = 4,  name = "Труба 4",  pos = Vector3.new(-3616.63, 93.50, 5278.25)},
+	{id = 5,  name = "Труба 5",  pos = Vector3.new(-3419.04, 93.50, 5230.96)},
+	{id = 6,  name = "Труба 6",  pos = Vector3.new(-3470.64, 93.50, 5412.19)},
+	{id = 7,  name = "Труба 7",  pos = Vector3.new(-3425.63, 95.00, 5463.00)},
+	{id = 8,  name = "Труба 8",  pos = Vector3.new(-3527.75, 93.50, 5588.77)},
+	{id = 9,  name = "Труба 9",  pos = Vector3.new(-3464.73, 110.50, 5665.48)},
+	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
 
-local function getLimbPriority(name)
-    local lower = name:lower()
-    for index, limb in ipairs(limbPriority) do
-        if lower:find(limb:lower(), 1, true) then return index end
-    end
-    return math.huge
+local currentRunId = 0
+local selectedPipeIndex = 1
+
+local function getCharacterComponents()
+	local char = player.Character
+	if not char then return nil, nil, nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hum or hum.Health <= 0 or not hrp then return nil, nil, nil end
+	return char, hum, hrp
 end
 
-local function sortLimbs()
-    table.sort(scannedLimbs, function(a, b)
-        local pa = getLimbPriority(a)
-        local pb = getLimbPriority(b)
-        if pa ~= pb then return pa < pb end
-        return a:lower() < b:lower()
-    end)
+local function safeLookAt(hrp, targetPos)
+	local currentPos = hrp.Position
+	local flatTarget = Vector3.new(targetPos.X, currentPos.Y, targetPos.Z)
+	if (flatTarget - currentPos).Magnitude > 0.1 then
+		hrp.CFrame = CFrame.new(currentPos, flatTarget)
+	end
 end
 
--- [NEW] debounced-обновление дропдауна лимбов — не пересортировываем
--- список при каждом добавленном BasePart, а батчим за 0.1с
-local scheduleLimbRefresh = debounce(function()
-    sortLimbs()
-    if getgenv().uiLE.targetLimbDropdown then
-        getgenv().uiLE.targetLimbDropdown:Refresh(scannedLimbs)
-    end
-end, 0.1)
+-- Очистка старого UI
+local oldGui = playerGui:FindFirstChild("PipeNavigatorGui")
+if oldGui then oldGui:Destroy() end
 
-local function registerLimb(name)
-    if not name or table.find(scannedLimbs, name) then return end
-    table.insert(scannedLimbs, name)
-    scheduleLimbRefresh() -- [FIX] было: sortLimbs() + Refresh() на каждый вызов
+-- GUI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "PipeNavigatorGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = playerGui
+
+local openBtn = Instance.new("TextButton")
+openBtn.Size = UDim2.new(0, 36, 0, 36)
+openBtn.Position = UDim2.new(0, 15, 0.4, 0)
+openBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+openBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+openBtn.Text = "Menu"
+openBtn.TextSize = 12
+openBtn.Font = Enum.Font.SourceSansBold
+openBtn.Visible = false
+openBtn.Parent = screenGui
+Instance.new("UICorner", openBtn).CornerRadius = UDim.new(1, 0)
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 270, 0, 250)
+mainFrame.Position = UDim2.new(0, 15, 0.3, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 30)
+title.Position = UDim2.new(0, 10, 0, 5)
+title.BackgroundTransparency = 1
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.Text = "Naramato Manager"
+title.Font = Enum.Font.SourceSansBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = mainFrame
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 25, 0, 25)
+minimizeBtn.Position = UDim2.new(1, -30, 0, 5)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+minimizeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+minimizeBtn.Text = "-"
+minimizeBtn.Font = Enum.Font.SourceSansBold
+minimizeBtn.Parent = mainFrame
+Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0, 4)
+
+local btnAll = Instance.new("TextButton")
+btnAll.Size = UDim2.new(0.9, 0, 0, 32)
+btnAll.Position = UDim2.new(0.05, 0, 0.16, 0)
+btnAll.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+btnAll.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnAll.Text = "Старт: Все трубы"
+btnAll.Font = Enum.Font.SourceSansBold
+btnAll.TextSize = 14
+btnAll.Parent = mainFrame
+Instance.new("UICorner", btnAll).CornerRadius = UDim.new(0, 4)
+
+local btnSelect = Instance.new("TextButton")
+btnSelect.Size = UDim2.new(0.9, 0, 0, 32)
+btnSelect.Position = UDim2.new(0.05, 0, 0.31, 0)
+btnSelect.BackgroundColor3 = Color3.fromRGB(40, 100, 180)
+btnSelect.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnSelect.Text = "Выбор трубы"
+btnSelect.Font = Enum.Font.SourceSansBold
+btnSelect.TextSize = 14
+btnSelect.Parent = mainFrame
+Instance.new("UICorner", btnSelect).CornerRadius = UDim.new(0, 4)
+
+local btnStop = Instance.new("TextButton")
+btnStop.Size = UDim2.new(0.9, 0, 0, 32)
+btnStop.Position = UDim2.new(0.05, 0, 0.46, 0)
+btnStop.BackgroundColor3 = Color3.fromRGB(90, 90, 90)
+btnStop.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnStop.Text = "Остановить"
+btnStop.Font = Enum.Font.SourceSansBold
+btnStop.TextSize = 14
+btnStop.Parent = mainFrame
+Instance.new("UICorner", btnStop).CornerRadius = UDim.new(0, 4)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(0.9, 0, 0, 20)
+statusLabel.Position = UDim2.new(0.05, 0, 0.63, 0)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
+statusLabel.Text = "Статус: Готов"
+statusLabel.Font = Enum.Font.SourceSans
+statusLabel.TextSize = 13
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Parent = mainFrame
+
+local distLabel = Instance.new("TextLabel")
+distLabel.Size = UDim2.new(0.9, 0, 0, 20)
+distLabel.Position = UDim2.new(0.05, 0, 0.73, 0)
+distLabel.BackgroundTransparency = 1
+distLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
+distLabel.Text = "Дистанция: -- studs"
+distLabel.Font = Enum.Font.SourceSans
+distLabel.TextSize = 13
+distLabel.TextXAlignment = Enum.TextXAlignment.Left
+distLabel.Parent = mainFrame
+
+local selectFrame = Instance.new("Frame")
+selectFrame.Size = UDim2.new(0, 200, 0, 250)
+selectFrame.Position = UDim2.new(0, 290, 0.3, 0)
+selectFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+selectFrame.Visible = false
+selectFrame.Parent = screenGui
+Instance.new("UICorner", selectFrame).CornerRadius = UDim.new(0, 8)
+
+local scrollList = Instance.new("ScrollingFrame")
+scrollList.Size = UDim2.new(0.9, 0, 0.9, 0)
+scrollList.Position = UDim2.new(0.05, 0, 0.05, 0)
+scrollList.BackgroundTransparency = 1
+scrollList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scrollList.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollList.Parent = selectFrame
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 4)
+listLayout.Parent = scrollList
+
+-- Обновление расстояния
+local lastUpdate = 0
+RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	if now - lastUpdate < 0.1 then return end
+	lastUpdate = now
+	
+	if not mainFrame.Visible then return end
+	local _, _, hrp = getCharacterComponents()
+	if not hrp then
+		distLabel.Text = "Дистанция: нет персонажа"
+		return
+	end
+	
+	local target = PIPE_POSITIONS[selectedPipeIndex]
+	if target then
+		local dist = (hrp.Position - target.pos).Magnitude
+		distLabel.Text = string.format("Дистанция (%s): %.1f studs", target.name, dist)
+	end
+end)
+
+-- Логика взаимодействия с трубой
+local function processSinglePipe(pipeData, myRunId)
+	if currentRunId ~= myRunId then return false end
+	
+	local char, hum, hrp = getCharacterComponents()
+	if not hrp then return false end
+	
+	statusLabel.Text = "Перемещение: " .. pipeData.name
+	
+	-- Сброс инерции и перемещение персонажа
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
+	
+	task.wait(0.3)
+	if currentRunId ~= myRunId then return false end
+	
+	safeLookAt(hrp, pipeData.pos)
+	
+	-- Берем оружие
+	local equippedTool = char:FindFirstChildOfClass("Tool")
+	if not equippedTool then
+		local backpack = player:FindFirstChild("Backpack")
+		if backpack then
+			equippedTool = backpack:FindFirstChildOfClass("Tool")
+			if equippedTool and hum then
+				hum:EquipTool(equippedTool)
+				task.wait(0.15)
+			end
+		end
+	end
+	
+	statusLabel.Text = "Атака: " .. pipeData.name
+	if equippedTool then
+		for _ = 1, 3 do
+			if currentRunId ~= myRunId then return false end
+			pcall(function() equippedTool:Activate() end)
+			task.wait(0.1)
+		end
+	end
+	
+	statusLabel.Text = "Обработано: " .. pipeData.name
+	return true
 end
 
-local function getPartPath(part, character)
-    local path = part.Name
-    local parent = part.Parent
-    while parent and parent ~= character do
-        path = parent.Name .. "." .. path
-        parent = parent.Parent
-    end
-    return path
+local function runWorkflow(targetPipeIndex)
+	currentRunId += 1
+	local myRunId = currentRunId
+	
+	task.spawn(function()
+		if targetPipeIndex then
+			selectedPipeIndex = targetPipeIndex
+			processSinglePipe(PIPE_POSITIONS[targetPipeIndex], myRunId)
+		else
+			for i, pipeData in ipairs(PIPE_POSITIONS) do
+				if currentRunId ~= myRunId then break end
+				selectedPipeIndex = i
+				local ok = processSinglePipe(pipeData, myRunId)
+				if not ok then break end
+				task.wait(0.2)
+			end
+			if currentRunId == myRunId then
+				statusLabel.Text = "Маршрут завершен"
+			end
+		end
+	end)
 end
 
-local function scanCharacter(character)
-    if not character then return end
-    table.clear(scannedLimbs)
-    for _, desc in ipairs(character:GetDescendants()) do
-        if desc:IsA("BasePart") then
-            registerLimb(getPartPath(desc, character))
-        end
-    end
+-- Кнопки
+for i, pipeData in ipairs(PIPE_POSITIONS) do
+	local pBtn = Instance.new("TextButton")
+	pBtn.Size = UDim2.new(1, -10, 0, 30)
+	pBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+	pBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	pBtn.Text = pipeData.name
+	pBtn.Font = Enum.Font.SourceSans
+	pBtn.TextSize = 13
+	pBtn.Parent = scrollList
+	Instance.new("UICorner", pBtn).CornerRadius = UDim.new(0, 4)
+	
+	pBtn.MouseButton1Click:Connect(function()
+		runWorkflow(i)
+	end)
 end
 
--- ==================================================================
--- [FIX] InitializeLimbScanning — теперь использует ConnectionManager,
--- чтобы не плодить дублирующиеся DescendantAdded-подключения
--- при повторных вызовах / респавнах персонажа
--- ==================================================================
-local function InitializeLimbScanning()
-    Connections.disconnectCategory("LimbScan")
-    Connections.disconnectCategory("LimbScan_Descendants")
+minimizeBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = false
+	selectFrame.Visible = false
+	openBtn.Visible = true
+end)
 
-    local function bindCharacter(character)
-        scanCharacter(character)
-        Connections.disconnectCategory("LimbScan_Descendants")
-        Connections.track("LimbScan_Descendants", character.DescendantAdded:Connect(function(desc)
-            if desc:IsA("BasePart") then registerLimb(getPartPath(desc, character)) end
-        end))
-    end
+openBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = true
+	openBtn.Visible = false
+end)
 
-    Connections.track("LimbScan", LocalPlayer.CharacterAdded:Connect(function(character)
-        bindCharacter(character)
-    end))
+btnSelect.MouseButton1Click:Connect(function()
+	selectFrame.Visible = not selectFrame.Visible
+end)
 
-    if LocalPlayer.Character then
-        bindCharacter(LocalPlayer.Character)
-    end
-end
+btnStop.MouseButton1Click:Connect(function()
+	currentRunId += 1
+	statusLabel.Text = "Остановлено"
+end)
 
-local scannedTeams = {}
-
-local function sortTeams()
-    table.sort(scannedTeams, function(a, b) return a:lower() < b:lower() end)
-end
-
--- [NEW] debounced-обновление командных дропдаунов
-local scheduleTeamRefresh = debounce(function()
-    sortTeams()
-    if getgenv().uiLE.whitelistTeamsDropdown then
-        getgenv().uiLE.whitelistTeamsDropdown:Refresh(scannedTeams)
-    end
-    if getgenv().uiLE.blacklistTeamsDropdown then
-        getgenv().uiLE.blacklistTeamsDropdown:Refresh(scannedTeams)
-    end
-end, 0.1)
-
-local function registerTeam(name)
-    if not name or table.find(scannedTeams, name) then return end
-    table.insert(scannedTeams, name)
-    scheduleTeamRefresh() -- [FIX]
-end
-
-local function unregisterTeam(name)
-    local idx = table.find(scannedTeams, name)
-    if idx then
-        table.remove(scannedTeams, idx)
-        scheduleTeamRefresh() -- [FIX]
-    end
-end
-
-local function scanTeams()
-    table.clear(scannedTeams)
-    local teamsService = game:GetService("Teams")
-    for _, team in ipairs(teamsService:GetChildren()) do
-        if team:IsA("Team") then
-            registerTeam(team.Name)
-        end
-    end
-end
-
--- ==================================================================
--- [FIX] InitializeTeamScanning — обе подписки (ChildAdded/ChildRemoved)
--- теперь трекаются и отключаются через ConnectionManager
--- ==================================================================
-local function InitializeTeamScanning()
-    Connections.disconnectCategory("TeamScan")
-    local teamsService = game:GetService("Teams")
-    scanTeams()
-    Connections.track("TeamScan", teamsService.ChildAdded:Connect(function(child)
-        if child:IsA("Team") then registerTeam(child.Name) end
-    end))
-    Connections.track("TeamScan", teamsService.ChildRemoved:Connect(function(child)
-        if child:IsA("Team") then unregisterTeam(child.Name) end
-    end))
-end
-
-local scannedPlayers = {}
-local nameToUserId = {}
-local userIdToName = {}
-
-local function sortPlayers()
-    table.sort(scannedPlayers, function(a, b) return a:lower() < b:lower() end)
-end
-
--- [NEW] debounced-обновление игровых дропдаунов
-local schedulePlayerRefresh = debounce(function()
-    sortPlayers()
-    if getgenv().uiLE.whitelistPlayersDropdown then
-        getgenv().uiLE.whitelistPlayersDropdown:Refresh(scannedPlayers)
-    end
-    if getgenv().uiLE.blacklistPlayersDropdown then
-        getgenv().uiLE.blacklistPlayersDropdown:Refresh(scannedPlayers)
-    end
-end, 0.1)
-
-local function registerPlayer(player)
-    if not player or not player:IsA("Player") then return end
-    local name = player.Name
-    if table.find(scannedPlayers, name) then return end
-    table.insert(scannedPlayers, name)
-    nameToUserId[name] = player.UserId
-    userIdToName[player.UserId] = name
-    schedulePlayerRefresh() -- [FIX]
-end
-
-local function unregisterPlayer(player)
-    if not player or not player:IsA("Player") then return end
-    local name = player.Name
-    local idx = table.find(scannedPlayers, name)
-    if idx then
-        table.remove(scannedPlayers, idx)
-        nameToUserId[name] = nil
-        userIdToName[player.UserId] = nil
-        schedulePlayerRefresh() -- [FIX]
-    end
-end
-
-local function scanPlayers()
-    table.clear(scannedPlayers)
-    table.clear(nameToUserId)
-    table.clear(userIdToName)
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            registerPlayer(player)
-        end
-    end
-end
-
--- ==================================================================
--- [FIX] InitializePlayerScanning — через ConnectionManager
--- ==================================================================
-local function InitializePlayerScanning()
-    Connections.disconnectCategory("PlayerScan")
-    scanPlayers()
-    Connections.track("PlayerScan", Players.PlayerAdded:Connect(function(player)
-        if player ~= LocalPlayer then registerPlayer(player) end
-    end))
-    Connections.track("PlayerScan", Players.PlayerRemoving:Connect(function(player)
-        unregisterPlayer(player)
-    end))
-end
-
-local function userIdArrayToNames(userIdArray)
-    if type(userIdArray) ~= "table" then return {} end
-    local names = {}
-    for _, uid in ipairs(userIdArray) do
-        local name = userIdToName[uid]
-        if name then table.insert(names, name) end
-    end
-    return names
-end
-
-local function normalizeVersion(s)
-    if not s then return nil end
-    return tostring(s):gsub("^%s+", ""):gsub("%s+$", ""):gsub("^v", "")
-end
-
-local CONFIG_FILE = "AXIOS_Config.json"
-local HttpService = game:GetService("HttpService")
-
-local function loadConfig()
-    if not (isfile and readfile) then return {} end
-    if not isfile(CONFIG_FILE) then return {} end
-    local ok, data = pcall(function() return readfile(CONFIG_FILE) end)
-    if not ok or not data then return {} end
-    local ok2, tbl = pcall(function() return HttpService:JSONDecode(data) end)
-    if ok2 and type(tbl) == "table" then return tbl end
-    return {}
-end
-
-local function saveConfig(tbl)
-    if not (writefile and type(tbl) == "table") then return false end
-    local ok, json = pcall(function() return HttpService:JSONEncode(tbl) end)
-    if not ok then return false end
-    local ok2 = pcall(function() writefile(CONFIG_FILE, json) end)
-    return ok2
-end
-
-local function persist_seen_version(ver)
-    if not ver then return end
-    local norm = normalizeVersion(ver)
-    local cfg = loadConfig()
-    cfg.lastSeenVersion = norm
-    saveConfig(cfg)
-end
-
-local function load_seen_from_file()
-    local cfg = loadConfig()
-    return normalizeVersion(cfg.lastSeenVersion)
-end
-
-local function saveUIVersion(version)
-    local cfg = loadConfig()
-    cfg.uiVersion = version
-    saveConfig(cfg)
-end
-
-local function loadUIVersion()
-    local cfg = loadConfig()
-    if cfg.uiVersion == 1 or cfg.uiVersion == 2 then
-        return cfg.uiVersion
-    end
-    return 2
-end
-
-getgenv().ChangelogHelper = getgenv().ChangelogHelper or (function()
-    local M = {}
-    local changelogs = {}
-    local tabHandle
-
-    local function buildBoxes(sections)
-        local boxes = {}
-        for _, sec in ipairs(sections or {}) do
-            local desc = ""
-            for i, it in ipairs(sec.items or {}) do
-                desc = desc .. "• " .. it .. (i < #sec.items and "\n" or "")
-            end
-            table.insert(boxes, { title = sec.title, description = desc })
-        end
-        return boxes
-    end
-
-    local function showPopup(window, entry)
-        if not window or not entry then return end
-        local content = nil
-        if entry.highlights and #entry.highlights > 0 then content = "Highlights:\n" .. table.concat(entry.highlights, "\n• ") end
-        local popup = {
-            title = entry.version or "Changelog",
-            subtitle = entry.date,
-            content = content,
-            boxes = buildBoxes(entry.sections),
-            options = {
-                { text = "Close", style = "primary" },
-                { text = "Copy notes", style = "neutral", callback = function()
-                    if setclipboard then
-                        local md = "# " .. (entry.version or "Changelog") .. "\n"
-                        if entry.date then md = md .. "_"..entry.date.."_\n\n" end
-                        if entry.highlights then
-                            md = md .. "## Highlights\n"
-                            for _, h in ipairs(entry.highlights) do md = md .. "- " .. h .. "\n" end
-                            md = md .. "\n"
-                        end
-                        for _, s in ipairs(entry.sections or {}) do
-                            md = md .. "## " .. s.title .. "\n"
-                            for _, it in ipairs(s.items or {}) do md = md .. "- " .. it .. "\n" end
-                            md = md .. "\n"
-                        end
-                        setclipboard(md)
-                    end
-                end },
-            },
-            dismissable = true,
-        }
-        local ok = pcall(function() window:Popup(popup) end) -- [FIX] pcall-обёртка
-        if not ok then Logger.warn("Failed to show changelog popup") end
-    end
-
-    local function createTab(window)
-        if tabHandle then return tabHandle end
-        if not window then return nil end
-        local t = window:CreateTab({ name = "Changelog" })
-        t:CreateSection({ name = "Releases" })
-        for i, entry in ipairs(changelogs) do
-            local title = entry.version or ("Release " .. i)
-            local descr = entry.date or ""
-            t:CreateButton({
-                name = title,
-                description = descr,
-                callback = function()
-                    showPopup(window, entry)
-                    persist_seen_version(entry.version)
-                end,
-            })
-        end
-        tabHandle = t
-        return t
-    end
-
-    M.add = function(entry)
-        table.insert(changelogs, 1, entry or {})
-        tabHandle = nil
-    end
-
-    M.reset = function()
-        table.clear(changelogs)
-        tabHandle = nil
-    end
-
-    M.register = function(window, opts)
-        createTab(window)
-        opts = opts or {}
-        local latestRaw = changelogs[1] and changelogs[1].version
-        if not latestRaw then return end
-        local latest = normalizeVersion(latestRaw)
-        local seen = load_seen_from_file()
-        local wantPopups = window:Get("Changelog.ShowPopups")
-        if wantPopups == nil then wantPopups = true end
-
-        local function parseFullSemver(v)
-            if not v then return nil end
-            local major, minor, patch = v:match("^(%d+)%.(%d+)%.?(%d*)$")
-            return tonumber(major), tonumber(minor), tonumber(patch) or 0
-        end
-
-        local function significant(oldV, newV)
-            if not newV then return false end
-            if not oldV then return true end
-            local o1,o2 = parseFullSemver(oldV) 
-            local n1,n2 = parseFullSemver(newV) 
-            if not (o1 and n1) then return true end
-            if n1 > o1 then return true end
-            if (n2 and o2) and n2 > o2 then return true end
-            return false
-        end
-
-        if seen == latest then return end
-
-        local entryToShow
-        if seen == nil then
-            local latestMajor, latestMinor, latestPatch = parseFullSemver(latest)
-            for i, entry in ipairs(changelogs) do
-                local major, minor, patch = parseFullSemver(entry.version)
-                if major == latestMajor and minor == latestMinor and patch == 0 then
-                    entryToShow = entry
-                    break
-                end
-            end
-            entryToShow = entryToShow or changelogs[1]
-        else
-            entryToShow = changelogs[1]
-        end
-
-        if entryToShow then
-            if significant(seen, entryToShow.version) and wantPopups and opts.showPopupOnUpdate ~= false then
-                local shouldNotify = true
-                if entryToShow.notify ~= nil then shouldNotify = entryToShow.notify end
-                if shouldNotify then
-                    pcall(function() window:Toast({ title = "New update: " .. (entryToShow.version or latest), subtitle = (entryToShow.date or "") }) end) -- [FIX]
-                    task.spawn(function()
-                        task.wait(0.18)
-                        showPopup(window, entryToShow)
-                    end)
-                else
-                    pcall(function() window:Toast({ title = "Updated to " .. (entryToShow.version or latest) }) end) -- [FIX]
-                end
-                persist_seen_version(entryToShow.version)
-            else
-                pcall(function() window:Toast({ title = "Updated: " .. (entryToShow.version or latest) }) end) -- [FIX]
-                persist_seen_version(entryToShow.version)
-            end
-        end
-    end
-
-    M.list = function() return changelogs end
-    return M
-end)()
-
--- ==================================================================
--- [FIX] loadRemoteChangelogs — теперь кэширует JSON локально и
--- умеет работать оффлайн, если GitHub/Rubis недоступны
--- ==================================================================
-local function loadRemoteChangelogs()
-    local changelogURLs = {
-        "https://raw.githubusercontent.com/AAPVdev/scripts/refs/heads/main/changelogs.json",
-        "https://api.rubis.app/v2/scrap/5olUvAKK803Tl2js/raw"
-    }
-    local cacheFile = "AXIOS_Changelog_Cache.json"
-
-    for _, url in ipairs(changelogURLs) do
-        local content = fetchUrlList({url})
-        if content then
-            local success, data = pcall(function() return game:GetService("HttpService"):JSONDecode(content) end)
-            if success and type(data) == "table" then
-                if writefile then
-                    pcall(function() writefile(cacheFile, content) end)
-                end
-                for i = #data, 1, -1 do
-                    getgenv().ChangelogHelper.add(data[i])
-                end
-                return true
-            else
-                Logger.warn("Failed to decode changelog JSON from " .. url)
-            end
-        end
-    end
-
-    if isfile and readfile and isfile(cacheFile) then
-        local okr, cached = pcall(readfile, cacheFile)
-        if okr and cached and cached ~= "" then
-            local ok2, data = pcall(function() return game:GetService("HttpService"):JSONDecode(cached) end)
-            if ok2 and type(data) == "table" then
-                Logger.warn("Loaded changelogs from local cache (offline fallback)")
-                for i = #data, 1, -1 do
-                    getgenv().ChangelogHelper.add(data[i])
-                end
-                return true
-            end
-        end
-    end
-
-    Logger.error("Failed to load changelogs from network and cache")
-    return false
-end
-
--- ==================================================================
--- [NEW] Watermark — плавающий индикатор FPS/Ping/статуса
--- ==================================================================
-local function initWatermark()
-    local RunService = game:GetService("RunService")
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "AXIOS_Watermark"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 999
-
-    local parentGui = (gethui and gethui()) or game:GetService("CoreGui")
-    local okParent = pcall(function() gui.Parent = parentGui end)
-    if not okParent then
-        gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-    end
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0, 280, 0, 24)
-    label.Position = UDim2.new(0, 8, 0, 8)
-    label.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-    label.BackgroundTransparency = 0.25
-    label.TextColor3 = Color3.fromRGB(255, 255, 255)
-    label.Font = Enum.Font.Code
-    label.TextSize = 14
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Text = "AXIOS"
-    label.Visible = false
-    label.Parent = gui
-
-    getgenv().uiLE.WatermarkGui = gui
-    getgenv().uiLE.WatermarkLabel = label
-
-    local acc = 0
-    Connections.track("Watermark", RunService.Heartbeat:Connect(function(dt)
-        if not label.Visible then return end
-        acc = acc + dt
-        if acc < 0.2 then return end
-        acc = 0
-
-        local fps = math.floor(1 / math.max(dt, 1e-4))
-        local ping = 0
-        local okp, val = pcall(function()
-            return game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()
-        end)
-        if okp and val then ping = math.floor(val) end
-
-        local status = safeGet("ModifyLimbs") and "ON" or "OFF"
-        label.Text = string.format("AXIOS | FPS: %d | Ping: %dms | Limbs: %s", fps, ping, status)
-    end))
-end
-
-local function BuildUI(version)
-    local oldActive = getgenv().uiLE.ActiveUI
-    if oldActive then
-        local w = oldActive.Window
-        local v = oldActive.version
-        if v == 1 then
-            getgenv().uiLE.uilibray:Destroy()
-        elseif v == 2 then
-            w:Unload()
-        end
-        getgenv().uiLE.ActiveUI = nil
-    end
-
-    saveUIVersion(version)
-    getgenv().uiLE.uiVersion = version
-
-    getgenv().RAYFIELD_SECURE = true
-    getgenv().RAYFIELD_ASSET_ID = 84895246331982
-
-    local libURL = version == 1 and "https://sirius.menu/rayfield" or "https://sirius.menu/gen2"
-    -- [FIX] загрузка библиотеки UI с кэш-фоллбэком
-    local uiCacheFile = version == 1 and "AXIOS_UI_Cache_Gen1.lua" or "AXIOS_UI_Cache_Gen2.lua"
-    getgenv().uiLE.uilibray = fetchAndCacheScript({libURL}, uiCacheFile)
-    if not getgenv().uiLE.uilibray then getgenv().uiLE.loading = false; return end
-
-    local Rayfield = getgenv().uiLE.uilibray
-
-    local LOADING_SUBTITLES = {
-        "multiply by delta",
-        "working for the cia",
-        "shoutout serene fr",
-        "avis was here",
-        "seizure causing soap?",
-        "skids skid from skids"
-    }
-
-    local Window
-    if version == 1 then
-        Window = Rayfield:CreateWindow({
-            Name = "AXIOS",
-            ScriptID = "sid_k2rgzy25rkgy",
-            LoadingTitle = "AXIOS",
-            LoadingSubtitle = LOADING_SUBTITLES[math.random(#LOADING_SUBTITLES)],
-            Theme = "Default",
-            DisableRayfieldPrompts = true,
-            ConfigurationSaving = {
-                Enabled = true,
-                FolderName = "LimbExtenderConfigs",
-                FileName = "Configuration",
-            },
-        })
-    else
-        Window = Rayfield:CreateWindow({
-            name = "AXIOS",
-            subtitle = LOADING_SUBTITLES[math.random(#LOADING_SUBTITLES)],
-            theme = "default",
-            configuration = {
-                autoSave = true,
-                autoLoad = true,
-                fileName = "Configuration",
-                customFolder = "LimbExtenderConfigs",
-            },
-        })
-        getgenv().uiLE.uilibray.Window = Window
-    end
-
-    getgenv().uiLE.ActiveUI = {Window = Window, version = version}
-
-    -- [NEW] safeSection — ошибка в одной секции не валит остальной UI
-    local function safeSection(name, fn)
-        local ok, err = pcall(fn)
-        if not ok then
-            Logger.error("UI section '" .. name .. "' failed: " .. tostring(err))
-        end
-    end
-
-    local function createSection(tab, title)
-        if version == 1 then tab:CreateSection(title) else tab:CreateSection({ name = title }) end
-    end
-
-    local function createToggle(tab, name, flag, default, customCallback)
-        default = default or false
-        getgenv().uiLE.knownFlags[flag] = true -- [NEW] регистрация флага
-        local saved = safeGet(flag) -- [FIX]
-        local value = saved ~= nil and saved or default
-        local callbackFn = customCallback or function(v) safeSet(flag, v) end
-        if version == 1 then
-            return tab:CreateToggle({
-                Name = name, Flag = flag, CurrentValue = value,
-                Callback = function(v)
-                    callbackFn(v)
-                    safeSet(flag, v) -- [FIX]
-                end,
-            })
-        else
-            return tab:CreateToggle({
-                name = name, flag = flag, value = value,
-                callback = function(v)
-                    callbackFn(v)
-                    safeSet(flag, v) -- [FIX]
-                end,
-            })
-        end
-    end
-
-    local function createSlider(tab, name, flag, range, increment, suffix, default)
-        default = default or range[1]
-        getgenv().uiLE.knownFlags[flag] = true -- [NEW]
-        local saved = safeGet(flag) -- [FIX]
-        local value = saved ~= nil and saved or default
-        if version == 1 then
-            return tab:CreateSlider({
-                Name = name, Flag = flag, CurrentValue = value,
-                Range = range, Increment = increment, Suffix = suffix or "",
-                Callback = function(v) safeSet(flag, v) end, -- [FIX]
-            })
-        else
-            return tab:CreateSlider({
-                name = name, flag = flag, value = value,
-                range = range, increment = increment, suffix = suffix or "",
-                callback = function(v) safeSet(flag, v) end, -- [FIX]
+btnAll.MouseButton1Click:Connect(function()
+	runWorkflow(nil)
+end)
