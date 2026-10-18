@@ -1,4 +1,5 @@
--- Standalone LocalScript (Сбалансированные повторы и удары)
+
+-- Standalone LocalScript (Диагностическая версия)
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
@@ -18,13 +19,8 @@ local PIPE_POSITIONS = {
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
 
--- Координаты дополнительного оборудования
 local GENERATOR_POS = Vector3.new(-1714.53, 133.61, 3343.56)
 local COMMUNIC_POS = Vector3.new(-2708.10, 231.62, 3462.68)
-
--- НАСТРОЙКИ ПОВТОРОВ
-local TELEPORT_ATTEMPTS = 3
-local TELEPORT_PAUSE = 0.4
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -42,7 +38,6 @@ end
 local oldGui = playerGui:FindFirstChild("PipeNavigatorGui")
 if oldGui then oldGui:Destroy() end
 
--- Создание интерфейса
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "PipeNavigatorGui"
 screenGui.ResetOnSpawn = false
@@ -72,7 +67,7 @@ title.Size = UDim2.new(1, -40, 0, 30)
 title.Position = UDim2.new(0, 10, 0, 5)
 title.BackgroundTransparency = 1
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.Text = "Naramato Manager"
+title.Text = "Naramato Debug"
 title.Font = Enum.Font.SourceSansBold
 title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
@@ -88,7 +83,6 @@ minimizeBtn.Font = Enum.Font.SourceSansBold
 minimizeBtn.Parent = mainFrame
 Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0, 4)
 
--- Кнопки интерфейса
 local btnAll = Instance.new("TextButton")
 btnAll.Size = UDim2.new(0.9, 0, 0, 32)
 btnAll.Position = UDim2.new(0.05, 0, 0.13, 0)
@@ -155,7 +149,6 @@ statusLabel.TextSize = 13
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.Parent = mainFrame
 
--- Окно списка труб
 local selectFrame = Instance.new("Frame")
 selectFrame.Size = UDim2.new(0, 200, 0, 250)
 selectFrame.Position = UDim2.new(0, 290, 0.25, 0)
@@ -176,26 +169,138 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Функция телепорта с повторами (держать позицию)
+-- Безопасная функция с отловом ошибок (pcall)
 local function processSinglePipe(pipeData, myRunId)
-	if currentRunId ~= myRunId then return false end
-	
-	local char, hum, hrp = getCharacterComponents()
-	if not hrp then return false end
-	
-	statusLabel.Text = "ТП (удержание): " .. pipeData.name
-	
-	-- Несколько попыток фиксации на точке
-	for attempt = 1, TELEPORT_ATTEMPTS do
-		if currentRunId ~= myRunId then return false end
+	local success, err = pcall(function()
+		if currentRunId ~= myRunId then return end
+		
+		local char, hum, hrp = getCharacterComponents()
+		if not hrp then
+			statusLabel.Text = "Ошибка: Нет HRP!"
+			return
+		end
+		
+		statusLabel.Text = "ТП к: " .. pipeData.name
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
-		task.wait(TELEPORT_PAUSE)
+		task.wait(0.5)
+		
+		if currentRunId ~= myRunId then return end
+		
+		-- Проверка инструмента
+		local tool = char:FindFirstChildOfClass("Tool")
+		if not tool then
+			local bp = player:FindFirstChild("Backpack")
+			if bp then
+				tool = bp:FindFirstChildOfClass("Tool")
+				if tool and hum then
+					hum:EquipTool(tool)
+					task.wait(0.3)
+				end
+			end
+		end
+		
+		if tool then
+			statusLabel.Text = "Бью: " .. pipeData.name
+			for i = 1, 3 do
+				if currentRunId ~= myRunId then break end
+				pcall(function() tool:Activate() end)
+				task.wait(0.3)
+			end
+		else
+			statusLabel.Text = "Инструмент не найден!"
+		end
+	end)
+	
+	if not success then
+		print("Ошибка в скрипте: ", err)
+		statusLabel.Text = "Ошибка в консоли (F9)"
 	end
+end
+
+local function runWorkflow(targetPipeIndex)
+	currentRunId += 1
+	local myRunId = currentRunId
 	
-	local _, _, currentHrp = getCharacterComponents()
-	if not currentHrp then return false end
+	task.spawn(function()
+		if targetPipeIndex then
+			processSinglePipe(PIPE_POSITIONS[targetPipeIndex], myRunId)
+			statusLabel.Text = "Готово: " .. PIPE_POSITIONS[targetPipeIndex].name
+		else
+			for i, pipeData in ipairs(PIPE_POSITIONS) do
+				if currentRunId ~= myRunId then break end
+				processSinglePipe(pipeData, myRunId)
+				task.wait(0.5)
+			end
+			if currentRunId == myRunId then
+				statusLabel.Text = "Все трубы пройдены!"
+			end
+		end
+	end)
+end
+
+local function teleportToLocation(targetPos, locationName)
+	currentRunId += 1
+	local myRunId = currentRunId
 	
-	statusLabel.Text = "Ожидание / Прицел"
-	task.wait(0.3)
-	if currentRunId ~= myRunId then return false end
+	task.spawn(function()
+		local _, _, hrp = getCharacterComponents()
+		if not hrp then 
+			statusLabel.Text = "Ошибка: нет персонажа"
+			return 
+		end
+		
+		statusLabel.Text = "ТП: " .. locationName
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
+		statusLabel.Text = "Готово: " .. locationName
+	end)
+end
+
+for i, pipeData in ipairs(PIPE_POSITIONS) do
+	local pBtn = Instance.new("TextButton")
+	pBtn.Size = UDim2.new(1, -10, 0, 30)
+	pBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+	pBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	pBtn.Text = pipeData.name
+	pBtn.Font = Enum.Font.SourceSans
+	pBtn.TextSize = 13
+	pBtn.Parent = scrollList
+	Instance.new("UICorner", pBtn).CornerRadius = UDim.new(0, 4)
+	
+	pBtn.MouseButton1Click:Connect(function()
+		runWorkflow(i)
+	end)
+end
+
+minimizeBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = false
+	selectFrame.Visible = false
+	openBtn.Visible = true
+end)
+
+openBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = true
+	openBtn.Visible = false
+end)
+
+btnSelect.MouseButton1Click:Connect(function()
+	selectFrame.Visible = not selectFrame.Visible
+end)
+
+btnGenerator.MouseButton1Click:Connect(function()
+	teleportToLocation(GENERATOR_POS, "Внешний генератор")
+end)
+
+btnCommunic.MouseButton1Click:Connect(function()
+	teleportToLocation(COMMUNIC_POS, "Коммуникации")
+end)
+
+btnStop.MouseButton1Click:Connect(function()
+	currentRunId += 1
+	statusLabel.Text = "Остановлено"
+end)
+
+btnAll.MouseButton1Click:Connect(function()
+	runWorkflow(nil)
+end)
