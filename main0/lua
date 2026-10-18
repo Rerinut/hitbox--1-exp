@@ -1,4 +1,4 @@
--- Standalone LocalScript (для запуска через Delta / клиент)
+-- Standalone LocalScript (с многократной телепортацией для обхода отката сервера)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
@@ -19,8 +19,9 @@ local PIPE_POSITIONS = {
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
 
--- НАСТРОЙКА ЗАДЕРЖКИ (увеличено до 2.5 секунд, чтобы сервер успевал принимать телепорт)
-local TELEPORT_PAUSE = 2.5 
+-- НАСТРОЙКИ
+local TELEPORT_ATTEMPTS = 3   -- Сколько раз подряд телепортировать к одной трубе
+local TELEPORT_PAUSE = 0.4    -- Пауза между повторными попытками телепорта
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -189,26 +190,31 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- Логика телепортации и атаки одной трубы
+-- Логика телепортации и атаки с многократным подтверждением позиции
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
 	local char, hum, hrp = getCharacterComponents()
 	if not hrp then return false end
 	
-	statusLabel.Text = "ТП: " .. pipeData.name
+	statusLabel.Text = "ТП (удержание): " .. pipeData.name
 	
-	-- Сброс скорости и телепорт
-	hrp.AssemblyLinearVelocity = Vector3.zero
-	hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
+	-- Несколько раз подряд принудительно устанавливаем позицию, чтобы сервер «сдался» и перестал откатывать
+	for attempt = 1, TELEPORT_ATTEMPTS do
+		if currentRunId ~= myRunId then return false end
+		
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
+		
+		task.wait(TELEPORT_PAUSE)
+	end
 	
-	-- Увеличенное время ожидания для стабилизации на сервере
-	task.wait(TELEPORT_PAUSE)
-	if currentRunId ~= myRunId then return false end
+	local _, _, currentHrp = getCharacterComponents()
+	if not currentHrp then return false end
 	
-	safeLookAt(hrp, pipeData.pos)
+	safeLookAt(currentHrp, pipeData.pos)
 	
-	-- Попытка достать и активировать оружие
+	-- Достаем оружие
 	local equippedTool = char:FindFirstChildOfClass("Tool")
 	if not equippedTool then
 		local backpack = player:FindFirstChild("Backpack")
@@ -234,7 +240,7 @@ local function processSinglePipe(pipeData, myRunId)
 	return true
 end
 
--- Запуск маршрута (Все трубы или выборочно)
+-- Запуск маршрута
 local function runWorkflow(targetPipeIndex)
 	currentRunId += 1
 	local myRunId = currentRunId
@@ -250,7 +256,7 @@ local function runWorkflow(targetPipeIndex)
 				selectedPipeIndex = i
 				local ok = processSinglePipe(pipeData, myRunId)
 				if not ok then break end
-				task.wait(0.3) -- Пауза между трубами в общем цикле
+				task.wait(0.2)
 			end
 			if currentRunId == myRunId then
 				statusLabel.Text = "Все трубы пройдены!"
@@ -259,7 +265,7 @@ local function runWorkflow(targetPipeIndex)
 	end)
 end
 
--- Создание кнопок в меню выборочного уничтожения
+-- Кнопки в меню выбора
 for i, pipeData in ipairs(PIPE_POSITIONS) do
 	local pBtn = Instance.new("TextButton")
 	pBtn.Size = UDim2.new(1, -10, 0, 30)
@@ -272,11 +278,10 @@ for i, pipeData in ipairs(PIPE_POSITIONS) do
 	Instance.new("UICorner", pBtn).CornerRadius = UDim.new(0, 4)
 	
 	pBtn.MouseButton1Click:Connect(function()
-		runWorkflow(i) -- Запускает телепорт ровно к выбранной трубе
+		runWorkflow(i)
 	end)
 end
 
--- Привязка интерфейса
 minimizeBtn.MouseButton1Click:Connect(function()
 	mainFrame.Visible = false
 	selectFrame.Visible = false
