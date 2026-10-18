@@ -1,7 +1,7 @@
--- Naramato Pipe Checker v5: observation-only edition
--- Place in StarterPlayer > StarterPlayerScripts of a project you control.
--- This client script does not teleport, fire weapons, or damage objects.
--- The health-based result is an inference, NOT verified pipe health.
+-- Naramato Pipe Checker v6: авто-ТП по трубам + проверка по урону
+-- Для проекта, который ты контролируешь (StarterPlayerScripts / LocalScript).
+-- Скрипт телепортирует ТОЛЬКО твоего персонажа и следит за его здоровьем.
+-- Он не стреляет и не бьёт. Результат по урону — признак, а не серверное подтверждение.
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -23,10 +23,20 @@ local PIPES = {
 }
 
 -- НАСТРОЙКИ
-local CHECK_SECONDS = 5
-local MAX_DISTANCE = 16      -- studs по горизонтали (X/Z)
-local MAX_HEIGHT_DIFF = 30   -- допустимая разница по высоте (Y)
-local INFO_REFRESH = 0.25    -- как часто обновлять расстояние на панели, сек
+local CHECK_SECONDS = 5        -- сколько секунд наблюдать урон на каждой трубе
+local SETTLE_TIME = 0.8        -- после ТП урон не считаем (падение/приземление)
+local TELEPORT_ATTEMPTS = 3    -- первичные повторы ТП (сервер может откатывать)
+local TELEPORT_PAUSE = 0.3
+local TELEPORT_HEIGHT = 3      -- на сколько studs выше точки трубы ставить персонажа
+local HOLD_INTERVAL = 0.25     -- как часто возвращать на трубу при сносе
+local HOLD_RADIUS = 10         -- дальше этого от трубы (по горизонтали) = вернуть
+local RUBBER_LIMIT = 6         -- больше откатов = проверка неполная
+local MAX_RETRIES = 3          -- повторы трубы, если персонаж погиб без урона
+local RESPAWN_TIMEOUT = 30     -- сколько ждать респавн, сек
+local PAUSE_BETWEEN = 0.5      -- пауза между трубами
+local ZONE_RADIUS = 16         -- для ручного режима (без ТП): горизонтальный радиус
+local MAX_HEIGHT_DIFF = 30     -- допустимая разница по высоте
+local INFO_REFRESH = 0.25
 local HOTKEY = Enum.KeyCode.RightShift
 
 -- СОСТОЯНИЕ
@@ -37,9 +47,12 @@ local lastTime = table.create(#PIPES, "")
 local selected = 1
 local runToken = 0
 local checking = false
-local checkingIndex = nil
-local activeConnection = nil
+local batchIndex, batchTotal = 0, 0
+local teleportEnabled = true
+local returnEnabled = true
 local connections = {}
+
+local DEFAULT_NOTE = "Урон — признак, но не серверное подтверждение."
 
 local function listen(signal, callback)
 	local c = signal:Connect(callback)
@@ -58,28 +71,23 @@ local function characterParts()
 	if h and root and h.Health > 0 then return h, root end
 end
 
--- Расстояние по горизонтали: высота игрока над землёй не мешает проверке
 local function flatDistance(a, b)
 	return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
 end
 
 local function inZone(root, i)
 	local p = PIPES[i]
-	return flatDistance(root.Position, p) <= MAX_DISTANCE
+	return flatDistance(root.Position, p) <= ZONE_RADIUS
 		and math.abs(root.Position.Y - p.Y) <= MAX_HEIGHT_DIFF
 end
 
-local function distanceTo(i)
+local function teleportTo(i)
 	local _, root = characterParts()
-	if not root then return nil end
-	return flatDistance(root.Position, PIPES[i])
-end
-
-local function disconnectCheck()
-	if activeConnection then
-		activeConnection:Disconnect()
-		activeConnection = nil
-	end
+	if not root then return false end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	player.Character:PivotTo(CFrame.new(PIPES[i] + Vector3.new(0, TELEPORT_HEIGHT, 0)))
+	return true
 end
 
 ----------------------------------------------------------------
@@ -100,7 +108,7 @@ local function instance(class, parent, props)
 	return obj
 end
 
--- side: nil = во всю ширину, "left"/"right" = половина ширины
+-- side: nil = во всю ширину, "left"/"right" = половина
 local function btn(parent, label, y, color, side)
 	local size = UDim2.new(1, -16, 0, 32)
 	local pos = UDim2.fromOffset(8, y)
@@ -111,8 +119,7 @@ local function btn(parent, label, y, color, side)
 		pos = UDim2.new(0.5, 4, 0, y)
 	end
 	local b = instance("TextButton", parent, {
-		Size = size,
-		Position = pos,
+		Size = size, Position = pos,
 		BackgroundColor3 = color or Color3.fromRGB(62, 85, 118),
 		TextColor3 = Color3.new(1, 1, 1),
 		Text = label, Font = Enum.Font.Gotham, TextSize = 13,
@@ -122,15 +129,15 @@ local function btn(parent, label, y, color, side)
 end
 
 local panel = instance("Frame", gui, {
-	Size = UDim2.fromOffset(330, 425),
-	Position = UDim2.new(0, 20, 0.2, 0),
+	Size = UDim2.fromOffset(330, 465),
+	Position = UDim2.new(0, 20, 0.15, 0),
 	BackgroundColor3 = Color3.fromRGB(26, 29, 36), BorderSizePixel = 0,
 })
 instance("UICorner", panel, {CornerRadius = UDim.new(0, 10)})
 
 local header = instance("TextLabel", panel, {
 	Size = UDim2.new(1, -84, 0, 34), Position = UDim2.fromOffset(9, 0),
-	Text = "NARAMATO | Pipe Checker v5", Font = Enum.Font.GothamBold,
+	Text = "NARAMATO | Pipe Checker v6", Font = Enum.Font.GothamBold,
 	TextSize = 14, BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1),
 	TextXAlignment = Enum.TextXAlignment.Left, Active = true,
 })
@@ -150,14 +157,14 @@ local closeButton = instance("TextButton", panel, {
 instance("UICorner", closeButton, {CornerRadius = UDim.new(0, 6)})
 
 local open = instance("TextButton", gui, {
-	Size = UDim2.fromOffset(42, 42), Position = UDim2.new(0, 20, 0.2, 0),
+	Size = UDim2.fromOffset(42, 42), Position = UDim2.new(0, 20, 0.15, 0),
 	Text = "N", TextSize = 20, Visible = false, TextColor3 = Color3.new(1, 1, 1),
 	BackgroundColor3 = Color3.fromRGB(35, 45, 65),
 })
 instance("UICorner", open, {CornerRadius = UDim.new(1, 0)})
 
 local choose = instance("ScrollingFrame", panel, {
-	Size = UDim2.new(1, -16, 0, 140), Position = UDim2.fromOffset(8, 37),
+	Size = UDim2.new(1, -16, 0, 120), Position = UDim2.fromOffset(8, 37),
 	BackgroundColor3 = Color3.fromRGB(37, 42, 51), BorderSizePixel = 0,
 	AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.fromOffset(0, 0),
 	ScrollBarThickness = 5,
@@ -165,27 +172,30 @@ local choose = instance("ScrollingFrame", panel, {
 instance("UIListLayout", choose, {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder})
 
 local info = instance("TextLabel", panel, {
-	Size = UDim2.new(1, -16, 0, 48), Position = UDim2.fromOffset(8, 181),
+	Size = UDim2.new(1, -16, 0, 48), Position = UDim2.fromOffset(8, 161),
 	BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1), TextWrapped = true,
 	TextSize = 12, Font = Enum.Font.Gotham, Text = "Выбери трубу",
 	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
 })
 
-local checkButton = btn(panel, "Проверить выбранную (" .. CHECK_SECONDS .. " сек)", 233, Color3.fromRGB(38, 125, 86))
-local nearestButton = btn(panel, "Ближайшая", 270, nil, "left")
-local nextButton = btn(panel, "Следующая", 270, nil, "right")
-local stopButton = btn(panel, "Остановить проверку", 307, Color3.fromRGB(135, 78, 58))
-local reportButton = btn(panel, "Отчёт", 344, nil, "left")
-local resetButton = btn(panel, "Сбросить всё", 344, Color3.fromRGB(95, 60, 60), "right")
+local checkButton = btn(panel, "Проверить выбранную", 213, Color3.fromRGB(38, 125, 86))
+local checkAllButton = btn(panel, "Проверить ВСЕ трубы (авто-ТП)", 249, Color3.fromRGB(45, 105, 160))
+local nearestButton = btn(panel, "Ближайшая", 285, nil, "left")
+local nextButton = btn(panel, "Следующая", 285, nil, "right")
+local stopButton = btn(panel, "Остановить", 321, Color3.fromRGB(135, 78, 58))
+local reportButton = btn(panel, "Отчёт", 357, nil, "left")
+local resetButton = btn(panel, "Сбросить всё", 357, Color3.fromRGB(95, 60, 60), "right")
+local tpToggle = btn(panel, "ТП: ВКЛ", 393, Color3.fromRGB(41, 110, 76), "left")
+local returnToggle = btn(panel, "Возврат: ВКЛ", 393, Color3.fromRGB(41, 110, 76), "right")
 
 local explanation = instance("TextLabel", panel, {
-	Size = UDim2.new(1, -16, 0, 38), Position = UDim2.fromOffset(8, 380),
-	BackgroundTransparency = 1, Text = "Урон — признак, но не серверное подтверждение.",
+	Size = UDim2.new(1, -16, 0, 30), Position = UDim2.fromOffset(8, 430),
+	BackgroundTransparency = 1, Text = DEFAULT_NOTE,
 	TextColor3 = Color3.fromRGB(190, 198, 210), TextSize = 11, TextWrapped = true,
 })
 
 local reportBox = instance("TextBox", gui, {
-	Size = UDim2.fromOffset(430, 280), Position = UDim2.new(0, 360, 0.2, 0),
+	Size = UDim2.fromOffset(430, 300), Position = UDim2.new(0, 360, 0.15, 0),
 	Text = "", TextEditable = false, MultiLine = true, ClearTextOnFocus = false,
 	TextWrapped = true,
 	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
@@ -207,8 +217,19 @@ placeReport()
 ----------------------------------------------------------------
 local buttons = {}
 
+local function damagedList()
+	local list = {}
+	for i = 1, #PIPES do
+		if statuses[i] == "Урон наблюдался" then table.insert(list, tostring(i)) end
+	end
+	return list
+end
+
 local function updateReport()
 	local lines = {"Naramato | отчёт наблюдений"}
+	local hit = damagedList()
+	table.insert(lines, "Урон на трубах: " .. (#hit > 0 and table.concat(hit, ", ") or "нет"))
+	table.insert(lines, "")
 	for i = 1, #PIPES do
 		local line = string.format("Труба %d: %s", i, statuses[i])
 		if details[i] ~= "" then line = line .. " (" .. details[i] .. ")" end
@@ -275,94 +296,241 @@ listen(RunService.Heartbeat, function(dt)
 end)
 
 ----------------------------------------------------------------
--- Проверка
+-- Проверка одной трубы
+-- Возвращает: "done" | "cancelled" | "lost"
 ----------------------------------------------------------------
-local function finish(token, idx, status, detail)
-	if runToken ~= token then return end
-	disconnectCheck()
+local function finishPipe(idx, status, detail)
 	statuses[idx] = status
 	details[idx] = detail
 	runs[idx] += 1
 	lastTime[idx] = os.date("%H:%M:%S")
-	checking = false
-	checkingIndex = nil
 	refresh()
 end
 
-local function stop()
-	runToken += 1
-	disconnectCheck()
-	if checking and checkingIndex then
-		statuses[checkingIndex] = "Проверка неполная"
-		details[checkingIndex] = "остановлена"
+local function damageDetail(damage, firstHit, peak, rubber)
+	local s = string.format("%.1f HP · 1-й %.1fс · пик %.1f", damage, firstHit or 0, peak)
+	if rubber > 0 then s = s .. string.format(" · откатов %d", rubber) end
+	return s
+end
+
+local function checkPipe(idx, token)
+	local function cancelled() return runToken ~= token end
+	if cancelled() then return "cancelled" end
+
+	statuses[idx] = "Проверяется"
+	details[idx] = ""
+	refresh()
+
+	-- 1) телепорт (несколько попыток подряд)
+	if teleportEnabled then
+		for _ = 1, TELEPORT_ATTEMPTS do
+			if cancelled() then return "cancelled" end
+			if not teleportTo(idx) then return "lost" end
+			task.wait(TELEPORT_PAUSE)
+		end
 	end
-	checking = false
-	checkingIndex = nil
-	refresh()
+
+	local humanoid, root = characterParts()
+	if not humanoid or not root then return "lost" end
+
+	if not inZone(root, idx) and not (teleportEnabled and flatDistance(root.Position, PIPES[idx]) <= HOLD_RADIUS) then
+		finishPipe(idx, "Проверка неполная",
+			teleportEnabled and "ТП не сработало (сервер вернул назад)" or "далеко от трубы")
+		return "done"
+	end
+
+	-- 2) наблюдение
+	local initialChar = player.Character
+	local settle = teleportEnabled and SETTLE_TIME or 0
+	local total = settle + CHECK_SECONDS
+	local lastHealth = humanoid.Health
+	local damage, peak, firstHit, rubber = 0, 0, nil, 0
+	local t, holdTimer = 0, 0
+
+	while t < total do
+		local dt = RunService.Heartbeat:Wait()
+		if cancelled() then return "cancelled" end
+		t += dt
+
+		-- здоровье читаем с сохранённого Humanoid: так видно и последний удар перед смертью
+		local hp = humanoid.Health
+		if t <= settle then
+			lastHealth = hp -- стабилизация: приземление не считаем уроном трубы
+		else
+			if hp < lastHealth then
+				local hit = lastHealth - hp
+				damage += hit
+				peak = math.max(peak, hit)
+				firstHit = firstHit or (t - settle)
+			end
+			lastHealth = hp
+		end
+
+		local h, r = characterParts()
+		if player.Character ~= initialChar or h ~= humanoid or not r then
+			if damage > 0 then
+				finishPipe(idx, "Урон наблюдался",
+					damageDetail(damage, firstHit, peak, rubber) .. " · персонаж погиб")
+				return "done"
+			end
+			return "lost"
+		end
+
+		if teleportEnabled then
+			holdTimer += dt
+			if holdTimer >= HOLD_INTERVAL then
+				holdTimer = 0
+				if flatDistance(r.Position, PIPES[idx]) > HOLD_RADIUS then
+					rubber += 1
+					teleportTo(idx)
+				end
+			end
+		elseif not inZone(r, idx) then
+			finishPipe(idx, "Проверка неполная", "персонаж вышел из зоны")
+			return "done"
+		end
+
+		local phase = (t <= settle) and "стабилизация после ТП"
+			or string.format("наблюдение %.1f/%.0f с", t - settle, CHECK_SECONDS)
+		info.Text = string.format("[%d/%d] Труба %d · %s\nУрон: %.1f HP · откатов ТП: %d",
+			batchIndex, batchTotal, idx, phase, damage, rubber)
+	end
+
+	-- 3) вердикт
+	if rubber > RUBBER_LIMIT then
+		local extra = damage > 0 and string.format(" (урон %.1f HP)", damage) or ""
+		finishPipe(idx, "Проверка неполная",
+			string.format("сервер возвращал назад %d раз", rubber) .. extra)
+	elseif damage > 0 then
+		finishPipe(idx, "Урон наблюдался", damageDetail(damage, firstHit, peak, rubber))
+	else
+		local s = string.format("0 HP за %.0f сек", CHECK_SECONDS)
+		if rubber > 0 then s = s .. string.format(" · откатов %d", rubber) end
+		finishPipe(idx, "Урон не наблюдался", s)
+	end
+	return "done"
 end
 
-local function runCheck()
+-- Обёртка: если персонаж погиб без урона — ждём респавн и повторяем ту же трубу
+-- Возвращает: "done" | "cancelled" | "failed"
+local function checkWithRetry(idx, token)
+	for attempt = 1, MAX_RETRIES do
+		local result = checkPipe(idx, token)
+		if result ~= "lost" then return result end
+
+		statuses[idx] = "Проверка неполная"
+		details[idx] = string.format("персонаж погиб, повтор %d/%d", attempt, MAX_RETRIES)
+		refresh()
+
+		local waited = 0
+		while waited < RESPAWN_TIMEOUT and not characterParts() do
+			if runToken ~= token then return "cancelled" end
+			task.wait(0.5)
+			waited += 0.5
+		end
+		if not characterParts() then return "failed" end
+		task.wait(1)
+	end
+	finishPipe(idx, "Проверка неполная", string.format("персонаж погиб %d раз подряд", MAX_RETRIES))
+	return "done"
+end
+
+----------------------------------------------------------------
+-- Запуск пачки проверок
+----------------------------------------------------------------
+local function returnHome(pivot)
+	if not (returnEnabled and pivot) then return end
+	for _ = 1, 2 do
+		local _, root = characterParts()
+		if not root then return end
+		root.AssemblyLinearVelocity = Vector3.zero
+		player.Character:PivotTo(pivot)
+		task.wait(0.3)
+	end
+end
+
+local function runWorkflow(list)
 	if checking then return end
+	if #list == 0 then return end
+
 	local humanoid, root = characterParts()
 	if not humanoid or not root then
 		info.Text = "Персонаж недоступен"
 		return
 	end
-	if not inZone(root, selected) then
-		info.Text = string.format("Подойди к трубе %d ближе %.0f studs", selected, MAX_DISTANCE)
-		return
-	end
-
-	checking = true
-	runToken += 1
-	local token = runToken
-	local pipeIndex = selected
-	checkingIndex = pipeIndex
-	local initialChar = player.Character
-	local lastHealth = humanoid.Health
-	local damage, peak, elapsed = 0, 0, 0
-	local firstHit = nil
-	statuses[pipeIndex] = "Проверяется"
-	details[pipeIndex] = ""
-	refresh()
-
-	activeConnection = RunService.Heartbeat:Connect(function(dt)
-		if runToken ~= token then return end
-		local h, r = characterParts()
-		if player.Character ~= initialChar or h ~= humanoid or not r
-			or not inZone(r, pipeIndex) then
-			finish(token, pipeIndex, "Проверка неполная", "персонаж вышел из зоны / погиб")
+	if not teleportEnabled then
+		if #list > 1 then
+			info.Text = "Для проверки всех труб включи ТП"
 			return
 		end
-
-		if h.Health < lastHealth then
-			local hit = lastHealth - h.Health
-			damage += hit
-			peak = math.max(peak, hit)
-			firstHit = firstHit or elapsed
+		if not inZone(root, list[1]) then
+			info.Text = string.format("Подойди к трубе %d ближе %.0f studs или включи ТП", list[1], ZONE_RADIUS)
+			return
 		end
-		lastHealth = h.Health
-		elapsed += dt
+	end
 
-		info.Text = string.format("Труба %d: проверка %.1f/%.0f с\nУрон за время проверки: %.1f HP",
-			pipeIndex, elapsed, CHECK_SECONDS, damage)
+	runToken += 1
+	local token = runToken
+	checking = true
+	batchTotal = #list
+	explanation.Text = DEFAULT_NOTE
+	local startPivot = player.Character:GetPivot()
 
-		if elapsed >= CHECK_SECONDS then
-			if damage > 0 then
-				finish(token, pipeIndex, "Урон наблюдался",
-					string.format("%.1f HP/%.0fс · 1-й на %.1fс · пик %.1f", damage, CHECK_SECONDS, firstHit or 0, peak))
-			else
-				finish(token, pipeIndex, "Урон не наблюдался",
-					string.format("0 HP за %.0f сек", CHECK_SECONDS))
+	task.spawn(function()
+		local ok, err = pcall(function()
+			for n, idx in ipairs(list) do
+				if runToken ~= token then break end
+				selected = idx
+				batchIndex = n
+				local result = checkWithRetry(idx, token)
+				if result == "cancelled" then
+					if statuses[idx] == "Проверяется" then
+						statuses[idx] = "Проверка неполная"
+						details[idx] = "остановлена"
+					end
+					break
+				elseif result == "failed" then
+					statuses[idx] = "Проверка неполная"
+					details[idx] = "не дождался респавна"
+					break
+				end
+				task.wait(PAUSE_BETWEEN)
 			end
+		end)
+
+		returnHome(startPivot)
+		checking = false
+		batchIndex = 0
+
+		if not ok then
+			info.Text = "Ошибка: " .. tostring(err)
+		elseif #list > 1 then
+			local hit = damagedList()
+			explanation.Text = "Итог: урон на трубах " .. (#hit > 0 and table.concat(hit, ", ") or "не наблюдался")
 		end
+		refresh()
 	end)
+end
+
+local function stop()
+	if checking then
+		runToken += 1 -- поток сам завершится, вернёт на место и снимет флаг checking
+	end
 end
 
 ----------------------------------------------------------------
 -- Кнопки
 ----------------------------------------------------------------
-listen(checkButton.MouseButton1Click, runCheck)
+listen(checkButton.MouseButton1Click, function()
+	runWorkflow({selected})
+end)
+
+listen(checkAllButton.MouseButton1Click, function()
+	local all = {}
+	for i = 1, #PIPES do table.insert(all, i) end
+	runWorkflow(all)
+end)
+
 listen(stopButton.MouseButton1Click, stop)
 
 listen(nextButton.MouseButton1Click, function()
@@ -395,7 +563,22 @@ listen(resetButton.MouseButton1Click, function()
 		runs[i] = 0
 		lastTime[i] = ""
 	end
+	explanation.Text = DEFAULT_NOTE
 	refresh()
+end)
+
+listen(tpToggle.MouseButton1Click, function()
+	if checking then return end
+	teleportEnabled = not teleportEnabled
+	tpToggle.Text = "ТП: " .. (teleportEnabled and "ВКЛ" or "ВЫКЛ")
+	tpToggle.BackgroundColor3 = teleportEnabled and Color3.fromRGB(41, 110, 76) or Color3.fromRGB(76, 79, 88)
+end)
+
+listen(returnToggle.MouseButton1Click, function()
+	if checking then return end
+	returnEnabled = not returnEnabled
+	returnToggle.Text = "Возврат: " .. (returnEnabled and "ВКЛ" or "ВЫКЛ")
+	returnToggle.BackgroundColor3 = returnEnabled and Color3.fromRGB(41, 110, 76) or Color3.fromRGB(76, 79, 88)
 end)
 
 listen(reportButton.MouseButton1Click, function()
@@ -458,8 +641,7 @@ end)
 -- Очистка при удалении GUI
 ----------------------------------------------------------------
 listen(gui.Destroying, function()
-	runToken += 1
-	disconnectCheck()
+	runToken += 1 -- активный поток завершится сам
 	for _, c in ipairs(connections) do c:Disconnect() end
 	table.clear(connections)
 end)
