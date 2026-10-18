@@ -1,4 +1,4 @@
--- Standalone LocalScript (без функции дистанции)
+-- Standalone LocalScript (без функции дистанции + кнопка генератора)
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
@@ -17,6 +17,9 @@ local PIPE_POSITIONS = {
 	{id = 9,  name = "Труба 9",  pos = Vector3.new(-3464.73, 110.50, 5665.48)},
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
+
+-- Координаты внешнего генератора
+local GENERATOR_POS = Vector3.new(-1714.53, 133.61, 3343.56)
 
 -- НАСТРОЙКИ
 local TELEPORT_ATTEMPTS = 5
@@ -66,7 +69,7 @@ openBtn.Parent = screenGui
 Instance.new("UICorner", openBtn).CornerRadius = UDim.new(1, 0)
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 270, 0, 220) -- Уменьшена высота окна, так как нет строки дистанции
+mainFrame.Size = UDim2.new(0, 270, 0, 260) -- Увеличили высоту для новой кнопки
 mainFrame.Position = UDim2.new(0, 15, 0.3, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.Parent = screenGui
@@ -95,7 +98,7 @@ Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0, 4)
 
 local btnAll = Instance.new("TextButton")
 btnAll.Size = UDim2.new(0.9, 0, 0, 32)
-btnAll.Position = UDim2.new(0.05, 0, 0.18, 0)
+btnAll.Position = UDim2.new(0.05, 0, 0.15, 0)
 btnAll.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
 btnAll.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnAll.Text = "Старт: Все трубы"
@@ -106,7 +109,7 @@ Instance.new("UICorner", btnAll).CornerRadius = UDim.new(0, 4)
 
 local btnSelect = Instance.new("TextButton")
 btnSelect.Size = UDim2.new(0.9, 0, 0, 32)
-btnSelect.Position = UDim2.new(0.05, 0, 0.35, 0)
+btnSelect.Position = UDim2.new(0.05, 0, 0.29, 0)
 btnSelect.BackgroundColor3 = Color3.fromRGB(40, 100, 180)
 btnSelect.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnSelect.Text = "Выбор трубы"
@@ -115,9 +118,21 @@ btnSelect.TextSize = 14
 btnSelect.Parent = mainFrame
 Instance.new("UICorner", btnSelect).CornerRadius = UDim.new(0, 4)
 
+-- Новая кнопка: Генератор внешний
+local btnGenerator = Instance.new("TextButton")
+btnGenerator.Size = UDim2.new(0.9, 0, 0, 32)
+btnGenerator.Position = UDim2.new(0.05, 0, 0.43, 0)
+btnGenerator.BackgroundColor3 = Color3.fromRGB(180, 130, 30)
+btnGenerator.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnGenerator.Text = "ТП: Внешний генератор"
+btnGenerator.Font = Enum.Font.SourceSansBold
+btnGenerator.TextSize = 14
+btnGenerator.Parent = mainFrame
+Instance.new("UICorner", btnGenerator).CornerRadius = UDim.new(0, 4)
+
 local btnStop = Instance.new("TextButton")
 btnStop.Size = UDim2.new(0.9, 0, 0, 32)
-btnStop.Position = UDim2.new(0.05, 0, 0.52, 0)
+btnStop.Position = UDim2.new(0.05, 0, 0.57, 0)
 btnStop.BackgroundColor3 = Color3.fromRGB(90, 90, 90)
 btnStop.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnStop.Text = "Остановить"
@@ -128,7 +143,7 @@ Instance.new("UICorner", btnStop).CornerRadius = UDim.new(0, 4)
 
 local statusLabel = Instance.new("TextLabel")
 statusLabel.Size = UDim2.new(0.9, 0, 0, 25)
-statusLabel.Position = UDim2.new(0.05, 0, 0.72, 0)
+statusLabel.Position = UDim2.new(0.05, 0, 0.77, 0)
 statusLabel.BackgroundTransparency = 1
 statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
 statusLabel.Text = "Статус: Готов"
@@ -232,6 +247,33 @@ local function runWorkflow(targetPipeIndex)
 	end)
 end
 
+-- Функция телепортации к генератору
+local function teleportToGenerator()
+	currentRunId += 1
+	local myRunId = currentRunId
+	
+	task.spawn(function()
+		local char, hum, hrp = getCharacterComponents()
+		if not hrp then 
+			statusLabel.Text = "Ошибка: нет персонажа"
+			return 
+		end
+		
+		statusLabel.Text = "ТП к генератору..."
+		
+		for attempt = 1, TELEPORT_ATTEMPTS do
+			if currentRunId ~= myRunId then return end
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.CFrame = CFrame.new(GENERATOR_POS + Vector3.new(0, 3, 0))
+			task.wait(TELEPORT_PAUSE)
+		end
+		
+		if currentRunId == myRunId then
+			statusLabel.Text = "Готово: Внешний генератор"
+		end
+	end)
+end
+
 -- Кнопки в меню выбора
 for i, pipeData in ipairs(PIPE_POSITIONS) do
 	local pBtn = Instance.new("TextButton")
@@ -262,6 +304,10 @@ end)
 
 btnSelect.MouseButton1Click:Connect(function()
 	selectFrame.Visible = not selectFrame.Visible
+end)
+
+btnGenerator.MouseButton1Click:Connect(function()
+	teleportToGenerator()
 end)
 
 btnStop.MouseButton1Click:Connect(function()
