@@ -1,4 +1,4 @@
--- Standalone LocalScript (с многократной телепортацией для обхода отката сервера)
+-- Standalone LocalScript (с увеличенной задержкой и многократным удержанием позиции)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
@@ -19,9 +19,10 @@ local PIPE_POSITIONS = {
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
 
--- НАСТРОЙКИ
-local TELEPORT_ATTEMPTS = 3   -- Сколько раз подряд телепортировать к одной трубе
-local TELEPORT_PAUSE = 0.4    -- Пауза между повторными попытками телепорта
+-- УВЕЛИЧЕННЫЕ НАСТРОЙКИ ДЛЯ ПРИЦЕЛИВАНИЯ И ОБХОДА АНТИ-ЧИТА
+local TELEPORT_ATTEMPTS = 5   -- Больше попыток закрепиться на точке
+local TELEPORT_PAUSE = 0.8    -- Увеличена пауза между попытками телепорта
+local PIPE_DELAY = 2.0        -- Дополнительная пауза перед атакой, чтобы вы успели прицелиться
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -190,7 +191,7 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- Логика телепортации и атаки с многократным подтверждением позиции
+-- Логика телепортации и атаки с замедлением и многократным удержанием
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
@@ -199,7 +200,7 @@ local function processSinglePipe(pipeData, myRunId)
 	
 	statusLabel.Text = "ТП (удержание): " .. pipeData.name
 	
-	-- Несколько раз подряд принудительно устанавливаем позицию, чтобы сервер «сдался» и перестал откатывать
+	-- Несколько повторных телепортов для преодоления анти-чита
 	for attempt = 1, TELEPORT_ATTEMPTS do
 		if currentRunId ~= myRunId then return false end
 		
@@ -213,6 +214,11 @@ local function processSinglePipe(pipeData, myRunId)
 	if not currentHrp then return false end
 	
 	safeLookAt(currentHrp, pipeData.pos)
+	
+	-- Дополнительная пауза перед атакой, чтобы вы успели прицелиться
+	statusLabel.Text = "Ожидание / Прицел: " .. pipeData.name
+	task.wait(PIPE_DELAY)
+	if currentRunId ~= myRunId then return false end
 	
 	-- Достаем оружие
 	local equippedTool = char:FindFirstChildOfClass("Tool")
@@ -229,10 +235,10 @@ local function processSinglePipe(pipeData, myRunId)
 	
 	statusLabel.Text = "Атака: " .. pipeData.name
 	if equippedTool then
-		for _ = 1, 4 do
+		for _ = 1, 5 do
 			if currentRunId ~= myRunId then return false end
 			pcall(function() equippedTool:Activate() end)
-			task.wait(0.15)
+			task.wait(0.2)
 		end
 	end
 	
@@ -256,7 +262,7 @@ local function runWorkflow(targetPipeIndex)
 				selectedPipeIndex = i
 				local ok = processSinglePipe(pipeData, myRunId)
 				if not ok then break end
-				task.wait(0.2)
+				task.wait(0.5) -- Пауза между переходом к следующей трубе
 			end
 			if currentRunId == myRunId then
 				statusLabel.Text = "Все трубы пройдены!"
