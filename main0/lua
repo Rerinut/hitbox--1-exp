@@ -1,7 +1,6 @@
--- Naramato Pipe Checker v6: авто-ТП по трубам + проверка по урону
+-- Naramato Pipe Checker v7: авто-ТП по трубам + проверка по урону (чистая версия)
 -- Для проекта, который ты контролируешь (StarterPlayerScripts / LocalScript).
 -- Скрипт телепортирует ТОЛЬКО твоего персонажа и следит за его здоровьем.
--- Он не стреляет и не бьёт. Результат по урону — признак, а не серверное подтверждение.
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -36,23 +35,19 @@ local RESPAWN_TIMEOUT = 30     -- сколько ждать респавн, се
 local PAUSE_BETWEEN = 0.5      -- пауза между трубами
 local ZONE_RADIUS = 16         -- для ручного режима (без ТП): горизонтальный радиус
 local MAX_HEIGHT_DIFF = 30     -- допустимая разница по высоте
-local INFO_REFRESH = 0.25
 local HOTKEY = Enum.KeyCode.RightShift
 
 -- СОСТОЯНИЕ
 local statuses = table.create(#PIPES, "Не проверена")
 local details = table.create(#PIPES, "")
-local runs = table.create(#PIPES, 0)
-local lastTime = table.create(#PIPES, "")
 local selected = 1
 local runToken = 0
 local checking = false
 local batchIndex, batchTotal = 0, 0
 local teleportEnabled = true
 local returnEnabled = true
+local summaryText = ""
 local connections = {}
-
-local DEFAULT_NOTE = "Урон — признак, но не серверное подтверждение."
 
 local function listen(signal, callback)
 	local c = signal:Connect(callback)
@@ -88,6 +83,14 @@ local function teleportTo(i)
 	root.AssemblyAngularVelocity = Vector3.zero
 	player.Character:PivotTo(CFrame.new(PIPES[i] + Vector3.new(0, TELEPORT_HEIGHT, 0)))
 	return true
+end
+
+local function damagedList()
+	local list = {}
+	for i = 1, #PIPES do
+		if statuses[i] == "Урон наблюдался" then table.insert(list, tostring(i)) end
+	end
+	return list
 end
 
 ----------------------------------------------------------------
@@ -129,7 +132,7 @@ local function btn(parent, label, y, color, side)
 end
 
 local panel = instance("Frame", gui, {
-	Size = UDim2.fromOffset(330, 465),
+	Size = UDim2.fromOffset(330, 435),
 	Position = UDim2.new(0, 20, 0.15, 0),
 	BackgroundColor3 = Color3.fromRGB(26, 29, 36), BorderSizePixel = 0,
 })
@@ -137,7 +140,7 @@ instance("UICorner", panel, {CornerRadius = UDim.new(0, 10)})
 
 local header = instance("TextLabel", panel, {
 	Size = UDim2.new(1, -84, 0, 34), Position = UDim2.fromOffset(9, 0),
-	Text = "NARAMATO | Pipe Checker v6", Font = Enum.Font.GothamBold,
+	Text = "NARAMATO | Pipe Checker v7", Font = Enum.Font.GothamBold,
 	TextSize = 14, BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1),
 	TextXAlignment = Enum.TextXAlignment.Left, Active = true,
 })
@@ -180,78 +183,26 @@ local info = instance("TextLabel", panel, {
 
 local checkButton = btn(panel, "Проверить выбранную", 213, Color3.fromRGB(38, 125, 86))
 local checkAllButton = btn(panel, "Проверить ВСЕ трубы (авто-ТП)", 249, Color3.fromRGB(45, 105, 160))
-local nearestButton = btn(panel, "Ближайшая", 285, nil, "left")
-local nextButton = btn(panel, "Следующая", 285, nil, "right")
+local nextButton = btn(panel, "Следующая труба", 285)
 local stopButton = btn(panel, "Остановить", 321, Color3.fromRGB(135, 78, 58))
-local reportButton = btn(panel, "Отчёт", 357, nil, "left")
-local resetButton = btn(panel, "Сбросить всё", 357, Color3.fromRGB(95, 60, 60), "right")
+local resetButton = btn(panel, "Сбросить всё", 357, Color3.fromRGB(95, 60, 60))
 local tpToggle = btn(panel, "ТП: ВКЛ", 393, Color3.fromRGB(41, 110, 76), "left")
 local returnToggle = btn(panel, "Возврат: ВКЛ", 393, Color3.fromRGB(41, 110, 76), "right")
-
-local explanation = instance("TextLabel", panel, {
-	Size = UDim2.new(1, -16, 0, 30), Position = UDim2.fromOffset(8, 430),
-	BackgroundTransparency = 1, Text = DEFAULT_NOTE,
-	TextColor3 = Color3.fromRGB(190, 198, 210), TextSize = 11, TextWrapped = true,
-})
-
-local reportBox = instance("TextBox", gui, {
-	Size = UDim2.fromOffset(430, 300), Position = UDim2.new(0, 360, 0.15, 0),
-	Text = "", TextEditable = false, MultiLine = true, ClearTextOnFocus = false,
-	TextWrapped = true,
-	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
-	TextSize = 12, Font = Enum.Font.Code, TextColor3 = Color3.new(1, 1, 1),
-	BackgroundColor3 = Color3.fromRGB(30, 35, 43), Visible = false,
-})
-instance("UICorner", reportBox, {CornerRadius = UDim.new(0, 8)})
-
-local function placeReport()
-	reportBox.Position = UDim2.new(
-		panel.Position.X.Scale, panel.Position.X.Offset + panel.Size.X.Offset + 10,
-		panel.Position.Y.Scale, panel.Position.Y.Offset
-	)
-end
-placeReport()
 
 ----------------------------------------------------------------
 -- Обновление отображения
 ----------------------------------------------------------------
 local buttons = {}
 
-local function damagedList()
-	local list = {}
-	for i = 1, #PIPES do
-		if statuses[i] == "Урон наблюдался" then table.insert(list, tostring(i)) end
-	end
-	return list
-end
-
-local function updateReport()
-	local lines = {"Naramato | отчёт наблюдений"}
-	local hit = damagedList()
-	table.insert(lines, "Урон на трубах: " .. (#hit > 0 and table.concat(hit, ", ") or "нет"))
-	table.insert(lines, "")
-	for i = 1, #PIPES do
-		local line = string.format("Труба %d: %s", i, statuses[i])
-		if details[i] ~= "" then line = line .. " (" .. details[i] .. ")" end
-		if runs[i] > 0 then
-			line = line .. string.format(" [проверок: %d, последняя %s]", runs[i], lastTime[i])
-		end
-		table.insert(lines, line)
-	end
-	reportBox.Text = table.concat(lines, "\n")
-end
-
 local function updateInfo()
 	if checking then return end
-	local _, root = characterParts()
-	local distText = "нет персонажа"
-	if root then
-		local zone = inZone(root, selected) and "в зоне" or "далеко"
-		distText = string.format("%.1f studs · %s", flatDistance(root.Position, PIPES[selected]), zone)
+	if summaryText ~= "" then
+		info.Text = summaryText
+		return
 	end
 	local second = statuses[selected]
 	if details[selected] ~= "" then second = second .. " | " .. details[selected] end
-	info.Text = string.format("Труба %d | %s\n%s", selected, distText, second)
+	info.Text = string.format("Труба %d\n%s", selected, second)
 end
 
 local function refresh()
@@ -266,7 +217,6 @@ local function refresh()
 		b.BackgroundColor3 = color
 		b.Text = string.format("%d | %s", i, statuses[i])
 	end
-	updateReport()
 end
 
 for i = 1, #PIPES do
@@ -281,19 +231,10 @@ for i = 1, #PIPES do
 	listen(b.MouseButton1Click, function()
 		if checking then return end
 		selected = index
+		summaryText = ""
 		refresh()
 	end)
 end
-
--- Живое обновление расстояния на панели
-local acc = 0
-listen(RunService.Heartbeat, function(dt)
-	acc += dt
-	if acc >= INFO_REFRESH then
-		acc = 0
-		updateInfo()
-	end
-end)
 
 ----------------------------------------------------------------
 -- Проверка одной трубы
@@ -302,8 +243,6 @@ end)
 local function finishPipe(idx, status, detail)
 	statuses[idx] = status
 	details[idx] = detail
-	runs[idx] += 1
-	lastTime[idx] = os.date("%H:%M:%S")
 	refresh()
 end
 
@@ -473,7 +412,7 @@ local function runWorkflow(list)
 	local token = runToken
 	checking = true
 	batchTotal = #list
-	explanation.Text = DEFAULT_NOTE
+	summaryText = ""
 	local startPivot = player.Character:GetPivot()
 
 	task.spawn(function()
@@ -506,7 +445,7 @@ local function runWorkflow(list)
 			info.Text = "Ошибка: " .. tostring(err)
 		elseif #list > 1 then
 			local hit = damagedList()
-			explanation.Text = "Итог: урон на трубах " .. (#hit > 0 and table.concat(hit, ", ") or "не наблюдался")
+			summaryText = "Итог: урон на трубах " .. (#hit > 0 and table.concat(hit, ", ") or "не наблюдался")
 		end
 		refresh()
 	end)
@@ -536,22 +475,7 @@ listen(stopButton.MouseButton1Click, stop)
 listen(nextButton.MouseButton1Click, function()
 	if checking then return end
 	selected = selected % #PIPES + 1
-	refresh()
-end)
-
-listen(nearestButton.MouseButton1Click, function()
-	if checking then return end
-	local _, root = characterParts()
-	if not root then
-		info.Text = "Персонаж недоступен"
-		return
-	end
-	local best, bestDist = selected, math.huge
-	for i = 1, #PIPES do
-		local d = flatDistance(root.Position, PIPES[i])
-		if d < bestDist then best, bestDist = i, d end
-	end
-	selected = best
+	summaryText = ""
 	refresh()
 end)
 
@@ -560,10 +484,8 @@ listen(resetButton.MouseButton1Click, function()
 	for i = 1, #PIPES do
 		statuses[i] = "Не проверена"
 		details[i] = ""
-		runs[i] = 0
-		lastTime[i] = ""
 	end
-	explanation.Text = DEFAULT_NOTE
+	summaryText = ""
 	refresh()
 end)
 
@@ -581,15 +503,9 @@ listen(returnToggle.MouseButton1Click, function()
 	returnToggle.BackgroundColor3 = returnEnabled and Color3.fromRGB(41, 110, 76) or Color3.fromRGB(76, 79, 88)
 end)
 
-listen(reportButton.MouseButton1Click, function()
-	reportBox.Visible = not reportBox.Visible
-	updateReport()
-end)
-
 listen(minimize.MouseButton1Click, function()
 	panel.Visible = false
 	open.Visible = true
-	reportBox.Visible = false
 end)
 
 listen(open.MouseButton1Click, function()
@@ -605,7 +521,6 @@ listen(UserInputService.InputBegan, function(input, processed)
 	if not processed and input.KeyCode == HOTKEY then
 		panel.Visible = not panel.Visible
 		open.Visible = not panel.Visible
-		if not panel.Visible then reportBox.Visible = false end
 	end
 end)
 
@@ -633,7 +548,6 @@ listen(UserInputService.InputChanged, function(input)
 		local delta = input.Position - dragStart
 		panel.Position = UDim2.new(frameStart.X.Scale, frameStart.X.Offset + delta.X,
 			frameStart.Y.Scale, frameStart.Y.Offset + delta.Y)
-		placeReport()
 	end
 end)
 
