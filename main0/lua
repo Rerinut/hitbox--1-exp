@@ -1,11 +1,11 @@
--- Standalone LocalScript (для запуска на стороне клиента)
+-- Standalone LocalScript (для запуска через Delta / клиент)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
--- 10 Точных координат
+-- 10 Точных координат труб
 local PIPE_POSITIONS = {
 	{id = 1,  name = "Труба 1",  pos = Vector3.new(-3806.71, 98.50, 5093.26)},
 	{id = 2,  name = "Труба 2",  pos = Vector3.new(-3960.26, 106.50, 5281.30)},
@@ -18,6 +18,9 @@ local PIPE_POSITIONS = {
 	{id = 9,  name = "Труба 9",  pos = Vector3.new(-3464.73, 110.50, 5665.48)},
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
+
+-- НАСТРОЙКА ЗАДЕРЖКИ (увеличено до 2.5 секунд, чтобы сервер успевал принимать телепорт)
+local TELEPORT_PAUSE = 2.5 
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -39,11 +42,11 @@ local function safeLookAt(hrp, targetPos)
 	end
 end
 
--- Очистка старого UI
+-- Очистка старого интерфейса
 local oldGui = playerGui:FindFirstChild("PipeNavigatorGui")
 if oldGui then oldGui:Destroy() end
 
--- GUI
+-- Создание интерфейса
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "PipeNavigatorGui"
 screenGui.ResetOnSpawn = false
@@ -144,6 +147,7 @@ distLabel.TextSize = 13
 distLabel.TextXAlignment = Enum.TextXAlignment.Left
 distLabel.Parent = mainFrame
 
+-- Окно выборочного списка труб
 local selectFrame = Instance.new("Frame")
 selectFrame.Size = UDim2.new(0, 200, 0, 250)
 selectFrame.Position = UDim2.new(0, 290, 0.3, 0)
@@ -164,7 +168,7 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Обновление расстояния
+-- Трекер расстояния
 local lastUpdate = 0
 RunService.Heartbeat:Connect(function()
 	local now = os.clock()
@@ -185,25 +189,26 @@ RunService.Heartbeat:Connect(function()
 	end
 end)
 
--- Логика взаимодействия с трубой
+-- Логика телепортации и атаки одной трубы
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
 	local char, hum, hrp = getCharacterComponents()
 	if not hrp then return false end
 	
-	statusLabel.Text = "Перемещение: " .. pipeData.name
+	statusLabel.Text = "ТП: " .. pipeData.name
 	
-	-- Сброс инерции и перемещение персонажа
+	-- Сброс скорости и телепорт
 	hrp.AssemblyLinearVelocity = Vector3.zero
 	hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
 	
-	task.wait(0.3)
+	-- Увеличенное время ожидания для стабилизации на сервере
+	task.wait(TELEPORT_PAUSE)
 	if currentRunId ~= myRunId then return false end
 	
 	safeLookAt(hrp, pipeData.pos)
 	
-	-- Берем оружие
+	-- Попытка достать и активировать оружие
 	local equippedTool = char:FindFirstChildOfClass("Tool")
 	if not equippedTool then
 		local backpack = player:FindFirstChild("Backpack")
@@ -211,24 +216,25 @@ local function processSinglePipe(pipeData, myRunId)
 			equippedTool = backpack:FindFirstChildOfClass("Tool")
 			if equippedTool and hum then
 				hum:EquipTool(equippedTool)
-				task.wait(0.15)
+				task.wait(0.2)
 			end
 		end
 	end
 	
 	statusLabel.Text = "Атака: " .. pipeData.name
 	if equippedTool then
-		for _ = 1, 3 do
+		for _ = 1, 4 do
 			if currentRunId ~= myRunId then return false end
 			pcall(function() equippedTool:Activate() end)
-			task.wait(0.1)
+			task.wait(0.15)
 		end
 	end
 	
-	statusLabel.Text = "Обработано: " .. pipeData.name
+	statusLabel.Text = "Готово: " .. pipeData.name
 	return true
 end
 
+-- Запуск маршрута (Все трубы или выборочно)
 local function runWorkflow(targetPipeIndex)
 	currentRunId += 1
 	local myRunId = currentRunId
@@ -237,22 +243,23 @@ local function runWorkflow(targetPipeIndex)
 		if targetPipeIndex then
 			selectedPipeIndex = targetPipeIndex
 			processSinglePipe(PIPE_POSITIONS[targetPipeIndex], myRunId)
+			statusLabel.Text = "Готово: " .. PIPE_POSITIONS[targetPipeIndex].name
 		else
 			for i, pipeData in ipairs(PIPE_POSITIONS) do
 				if currentRunId ~= myRunId then break end
 				selectedPipeIndex = i
 				local ok = processSinglePipe(pipeData, myRunId)
 				if not ok then break end
-				task.wait(0.2)
+				task.wait(0.3) -- Пауза между трубами в общем цикле
 			end
 			if currentRunId == myRunId then
-				statusLabel.Text = "Маршрут завершен"
+				statusLabel.Text = "Все трубы пройдены!"
 			end
 		end
 	end)
 end
 
--- Кнопки
+-- Создание кнопок в меню выборочного уничтожения
 for i, pipeData in ipairs(PIPE_POSITIONS) do
 	local pBtn = Instance.new("TextButton")
 	pBtn.Size = UDim2.new(1, -10, 0, 30)
@@ -265,10 +272,11 @@ for i, pipeData in ipairs(PIPE_POSITIONS) do
 	Instance.new("UICorner", pBtn).CornerRadius = UDim.new(0, 4)
 	
 	pBtn.MouseButton1Click:Connect(function()
-		runWorkflow(i)
+		runWorkflow(i) -- Запускает телепорт ровно к выбранной трубе
 	end)
 end
 
+-- Привязка интерфейса
 minimizeBtn.MouseButton1Click:Connect(function()
 	mainFrame.Visible = false
 	selectFrame.Visible = false
