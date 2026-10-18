@@ -1,4 +1,6 @@
--- Standalone LocalScript (исправленная версия)
+-- Standalone LocalScript v2
+-- Новое: повтор круга, продолжение после смерти, прогресс + таймер,
+-- атака до результата (через CHECK_BROKEN), горячая клавиша, кнопка закрытия
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 
@@ -23,13 +25,39 @@ local PIPE_POSITIONS = {
 local TELEPORT_ATTEMPTS = 5
 local TELEPORT_PAUSE = 0.8
 local PIPE_DELAY = 2.0
-local ATTACK_COUNT = 5
+local ATTACK_COUNT = 5        -- сколько ударов, если CHECK_BROKEN не задана
 local ATTACK_PAUSE = 0.2
+local ATTACK_MAX_TIME = 20    -- максимум секунд на трубу, если CHECK_BROKEN задана
+local MAX_RETRIES = 3         -- сколько раз повторять трубу после смерти
+local RESPAWN_TIMEOUT = 30    -- сколько секунд ждать респавн
+local HOTKEY = Enum.KeyCode.RightShift
+
+-- АТАКА ДО РЕЗУЛЬТАТА (необязательно).
+-- Если знаешь, как в игре выглядит сломанная труба, верни true, когда она сломана.
+-- Пример (подставь свои имена):
+-- local CHECK_BROKEN = function(pipeData)
+--     local pipe = workspace:FindFirstChild(pipeData.name)
+--     return pipe == nil or pipe:GetAttribute("Health") == 0
+-- end
+local CHECK_BROKEN = nil
 
 local COLOR_NORMAL = Color3.fromRGB(45, 45, 45)
 local COLOR_ACTIVE = Color3.fromRGB(40, 140, 80)
+local COLOR_OFF = Color3.fromRGB(70, 70, 70)
+local COLOR_ON = Color3.fromRGB(40, 140, 80)
 
+-- Состояние
 local currentRunId = 0
+local loopEnabled = false
+local isRunning = false
+local runStart = 0
+local progIndex, progTotal, progLap = 0, #PIPE_POSITIONS, 0
+local connections = {}
+
+local function track(conn)
+	table.insert(connections, conn)
+	return conn
+end
 
 ----------------------------------------------------------------
 -- Вспомогательные функции
@@ -51,6 +79,18 @@ local function safeLookAt(hrp, targetPos)
 	end
 end
 
+local function waitForCharacter(myRunId, timeout)
+	local waited = 0
+	while waited < timeout do
+		if currentRunId ~= myRunId then return nil end
+		local char, hum, hrp = getCharacterComponents()
+		if hrp then return char, hum, hrp end
+		task.wait(0.5)
+		waited += 0.5
+	end
+	return nil
+end
+
 local function makeButton(parent, text, color, size, position, textSize)
 	local btn = Instance.new("TextButton")
 	btn.Size = size
@@ -64,6 +104,20 @@ local function makeButton(parent, text, color, size, position, textSize)
 	btn.Parent = parent
 	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
 	return btn
+end
+
+local function makeLabel(parent, text, size, position, textSize)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = size
+	lbl.Position = position
+	lbl.BackgroundTransparency = 1
+	lbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+	lbl.Text = text
+	lbl.Font = Enum.Font.SourceSans
+	lbl.TextSize = textSize or 13
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Parent = parent
+	return lbl
 end
 
 ----------------------------------------------------------------
@@ -83,48 +137,43 @@ openBtn.Visible = false
 openBtn:FindFirstChildOfClass("UICorner").CornerRadius = UDim.new(1, 0)
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 270, 0, 190)
+mainFrame.Size = UDim2.new(0, 270, 0, 240)
 mainFrame.Position = UDim2.new(0, 15, 0.3, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.Parent = screenGui
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -40, 0, 30)
-title.Position = UDim2.new(0, 10, 0, 5)
-title.BackgroundTransparency = 1
+local title = makeLabel(mainFrame, "Naramato Manager", UDim2.new(1, -75, 0, 30),
+	UDim2.new(0, 10, 0, 5), 15)
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.Text = "Naramato Manager (перетащи меня)"
 title.Font = Enum.Font.SourceSansBold
-title.TextSize = 15
-title.TextXAlignment = Enum.TextXAlignment.Left
 title.Active = true
-title.Parent = mainFrame
 
 local minimizeBtn = makeButton(mainFrame, "-", Color3.fromRGB(50, 50, 50),
+	UDim2.new(0, 25, 0, 25), UDim2.new(1, -60, 0, 5))
+
+local closeBtn = makeButton(mainFrame, "X", Color3.fromRGB(150, 50, 50),
 	UDim2.new(0, 25, 0, 25), UDim2.new(1, -30, 0, 5))
 
 local btnAll = makeButton(mainFrame, "Старт: Все трубы", Color3.fromRGB(180, 50, 50),
 	UDim2.new(0.9, 0, 0, 32), UDim2.new(0.05, 0, 0, 40))
 
 local btnSelect = makeButton(mainFrame, "Выбор трубы", Color3.fromRGB(40, 100, 180),
-	UDim2.new(0.9, 0, 0, 32), UDim2.new(0.05, 0, 0, 80))
+	UDim2.new(0.9, 0, 0, 32), UDim2.new(0.05, 0, 0, 78))
 
 local btnStop = makeButton(mainFrame, "Остановить", Color3.fromRGB(90, 90, 90),
-	UDim2.new(0.9, 0, 0, 32), UDim2.new(0.05, 0, 0, 120))
+	UDim2.new(0.9, 0, 0, 32), UDim2.new(0.05, 0, 0, 116))
 
-local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(0.9, 0, 0, 25)
-statusLabel.Position = UDim2.new(0.05, 0, 0, 158)
-statusLabel.BackgroundTransparency = 1
-statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
-statusLabel.Text = "Статус: Готов"
-statusLabel.Font = Enum.Font.SourceSans
-statusLabel.TextSize = 13
-statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.Parent = mainFrame
+local btnLoop = makeButton(mainFrame, "Повторять круг: ВЫКЛ", COLOR_OFF,
+	UDim2.new(0.9, 0, 0, 28), UDim2.new(0.05, 0, 0, 154), 13)
 
--- Окно выбора трубы (дочернее к mainFrame, поэтому двигается вместе с ним)
+local progressLabel = makeLabel(mainFrame, "Не запущено",
+	UDim2.new(0.9, 0, 0, 20), UDim2.new(0.05, 0, 0, 187))
+
+local statusLabel = makeLabel(mainFrame, "Статус: Готов",
+	UDim2.new(0.9, 0, 0, 20), UDim2.new(0.05, 0, 0, 209))
+
+-- Окно выбора трубы (дочернее к mainFrame, двигается вместе с ним)
 local selectFrame = Instance.new("Frame")
 selectFrame.Size = UDim2.new(0, 200, 0, 250)
 selectFrame.Position = UDim2.new(1, 8, 0, 0)
@@ -153,7 +202,7 @@ listLayout.Parent = scrollList
 local dragging = false
 local dragStart, startPos
 
-title.InputBegan:Connect(function(input)
+track(title.InputBegan:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1
 		or input.UserInputType == Enum.UserInputType.Touch then
 		dragging = true
@@ -165,9 +214,9 @@ title.InputBegan:Connect(function(input)
 			end
 		end)
 	end
-end)
+end))
 
-UserInputService.InputChanged:Connect(function(input)
+track(UserInputService.InputChanged:Connect(function(input)
 	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
 		or input.UserInputType == Enum.UserInputType.Touch) then
 		local delta = input.Position - dragStart
@@ -176,10 +225,10 @@ UserInputService.InputChanged:Connect(function(input)
 			startPos.Y.Scale, startPos.Y.Offset + delta.Y
 		)
 	end
-end)
+end))
 
 ----------------------------------------------------------------
--- Подсветка текущей трубы в списке
+-- Подсветка трубы и прогресс
 ----------------------------------------------------------------
 local pipeButtons = {}
 
@@ -189,47 +238,59 @@ local function highlightPipe(index)
 	end
 end
 
+local function updateProgress()
+	if progIndex == 0 then
+		progressLabel.Text = "Не запущено"
+		return
+	end
+	local elapsed = math.floor(os.clock() - runStart)
+	local text = string.format("Труба %d/%d", progIndex, progTotal)
+	if progLap > 0 then
+		text = text .. string.format(" · круг %d", progLap)
+	end
+	text = text .. string.format(" · %02d:%02d", math.floor(elapsed / 60), elapsed % 60)
+	progressLabel.Text = text
+end
+
+-- Обновление таймера раз в секунду, пока идёт запуск
+task.spawn(function()
+	while screenGui.Parent do
+		if isRunning then updateProgress() end
+		task.wait(1)
+	end
+end)
+
 ----------------------------------------------------------------
 -- Логика телепортации и атаки
+-- Возвращает: "done" | "notool" | "cancelled" | "lost"
 ----------------------------------------------------------------
 local function processSinglePipe(pipeData, myRunId)
 	local function cancelled() return currentRunId ~= myRunId end
-	if cancelled() then return false end
+	if cancelled() then return "cancelled" end
 
-	-- Телепорт с удержанием; ссылки на персонажа обновляются на каждой попытке
+	-- Телепорт с удержанием
 	statusLabel.Text = "ТП (удержание): " .. pipeData.name
 	for _ = 1, TELEPORT_ATTEMPTS do
-		if cancelled() then return false end
+		if cancelled() then return "cancelled" end
 		local char, _, hrp = getCharacterComponents()
-		if not hrp then
-			statusLabel.Text = "Нет персонажа, жду респавн..."
-			task.wait(1)
-		else
-			hrp.AssemblyLinearVelocity = Vector3.zero
-			char:PivotTo(CFrame.new(pipeData.pos + Vector3.new(0, 3, 0)))
-			task.wait(TELEPORT_PAUSE)
-		end
+		if not hrp then return "lost" end
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		char:PivotTo(CFrame.new(pipeData.pos + Vector3.new(0, 3, 0)))
+		task.wait(TELEPORT_PAUSE)
 	end
 
 	local char, hum, hrp = getCharacterComponents()
-	if not hrp then
-		statusLabel.Text = "Персонаж потерян: " .. pipeData.name
-		return false
-	end
-
+	if not hrp then return "lost" end
 	safeLookAt(hrp, pipeData.pos)
 
 	statusLabel.Text = "Ожидание / Прицел: " .. pipeData.name
 	task.wait(PIPE_DELAY)
-	if cancelled() then return false end
+	if cancelled() then return "cancelled" end
 
-	-- Снова берём свежие ссылки после ожидания
 	char, hum = getCharacterComponents()
-	if not char then
-		statusLabel.Text = "Персонаж потерян: " .. pipeData.name
-		return false
-	end
+	if not char then return "lost" end
 
+	-- Берём инструмент
 	local tool = char:FindFirstChildOfClass("Tool")
 	if not tool then
 		local backpack = player:FindFirstChild("Backpack")
@@ -244,47 +305,121 @@ local function processSinglePipe(pipeData, myRunId)
 
 	if not tool then
 		statusLabel.Text = "Нет инструмента: " .. pipeData.name
+		return "notool"
+	end
+
+	-- Атака
+	statusLabel.Text = "Атака: " .. pipeData.name
+	if CHECK_BROKEN then
+		local startT = os.clock()
+		while os.clock() - startT < ATTACK_MAX_TIME do
+			if cancelled() then return "cancelled" end
+			if not getCharacterComponents() then return "lost" end
+			local okCheck, broken = pcall(CHECK_BROKEN, pipeData)
+			if okCheck and broken then break end
+			pcall(function() tool:Activate() end)
+			task.wait(ATTACK_PAUSE)
+		end
 	else
-		statusLabel.Text = "Атака: " .. pipeData.name
 		for _ = 1, ATTACK_COUNT do
-			if cancelled() then return false end
+			if cancelled() then return "cancelled" end
+			if not getCharacterComponents() then return "lost" end
 			pcall(function() tool:Activate() end)
 			task.wait(ATTACK_PAUSE)
 		end
 	end
 
-	return true
+	return "done"
+end
+
+-- Обёртка: при смерти ждёт респавн и повторяет ту же трубу
+-- Возвращает: "done" | "notool" | "cancelled" | "failed"
+local function processPipeWithRetry(pipeData, myRunId)
+	for attempt = 1, MAX_RETRIES do
+		local result = processSinglePipe(pipeData, myRunId)
+		if result ~= "lost" then return result end
+
+		statusLabel.Text = string.format("Персонаж потерян, жду респавн (%d/%d)", attempt, MAX_RETRIES)
+		local char = waitForCharacter(myRunId, RESPAWN_TIMEOUT)
+		if not char then
+			return (currentRunId ~= myRunId) and "cancelled" or "failed"
+		end
+		task.wait(1)
+	end
+	return "failed"
+end
+
+local function finishRun(myRunId)
+	if currentRunId == myRunId then
+		isRunning = false
+		updateProgress()
+	end
 end
 
 local function runWorkflow(targetPipeIndex)
 	currentRunId += 1
 	local myRunId = currentRunId
+	isRunning = true
+	runStart = os.clock()
+	progTotal = #PIPE_POSITIONS
+	progLap = 0
 
 	task.spawn(function()
 		if targetPipeIndex then
+			progIndex = targetPipeIndex
 			highlightPipe(targetPipeIndex)
+			updateProgress()
 			local pipeData = PIPE_POSITIONS[targetPipeIndex]
-			local ok = processSinglePipe(pipeData, myRunId)
-			if ok and currentRunId == myRunId then
+			local result = processPipeWithRetry(pipeData, myRunId)
+			if result == "done" and currentRunId == myRunId then
 				statusLabel.Text = "Готово: " .. pipeData.name
+			elseif result == "failed" and currentRunId == myRunId then
+				statusLabel.Text = "Не удалось: " .. pipeData.name
 			end
-		else
-			local finished = true
+			finishRun(myRunId)
+			return
+		end
+
+		local lap = 0
+		local keepGoing = true
+		while keepGoing do
+			lap += 1
+			progLap = lap
 			for i, pipeData in ipairs(PIPE_POSITIONS) do
 				if currentRunId ~= myRunId then return end
+				progIndex = i
 				highlightPipe(i)
-				local ok = processSinglePipe(pipeData, myRunId)
-				if not ok then
-					finished = false
-					break
+				updateProgress()
+
+				local result = processPipeWithRetry(pipeData, myRunId)
+				if result == "cancelled" then return end
+				if result == "failed" then
+					statusLabel.Text = "Прервано: " .. pipeData.name
+					finishRun(myRunId)
+					return
 				end
 				task.wait(0.5)
 			end
-			if currentRunId == myRunId then
-				statusLabel.Text = finished and "Все трубы пройдены!" or "Прервано (см. статус выше)"
+
+			if currentRunId ~= myRunId then return end
+			keepGoing = loopEnabled
+			if keepGoing then
+				statusLabel.Text = "Круг " .. lap .. " пройден, начинаю новый"
+				task.wait(1)
 			end
 		end
+
+		if currentRunId == myRunId then
+			statusLabel.Text = "Все трубы пройдены!"
+			finishRun(myRunId)
+		end
 	end)
+end
+
+local function stopRun()
+	currentRunId += 1
+	isRunning = false
+	statusLabel.Text = "Остановлено"
 end
 
 ----------------------------------------------------------------
@@ -304,25 +439,45 @@ end
 ----------------------------------------------------------------
 -- Обработчики основных кнопок
 ----------------------------------------------------------------
-minimizeBtn.MouseButton1Click:Connect(function()
-	mainFrame.Visible = false
-	openBtn.Visible = true
-end)
+local function setMenuVisible(visible)
+	mainFrame.Visible = visible
+	openBtn.Visible = not visible
+end
 
-openBtn.MouseButton1Click:Connect(function()
-	mainFrame.Visible = true
-	openBtn.Visible = false
-end)
+minimizeBtn.MouseButton1Click:Connect(function() setMenuVisible(false) end)
+openBtn.MouseButton1Click:Connect(function() setMenuVisible(true) end)
 
 btnSelect.MouseButton1Click:Connect(function()
 	selectFrame.Visible = not selectFrame.Visible
 end)
 
-btnStop.MouseButton1Click:Connect(function()
-	currentRunId += 1
-	statusLabel.Text = "Остановлено"
-end)
+btnStop.MouseButton1Click:Connect(stopRun)
 
 btnAll.MouseButton1Click:Connect(function()
 	runWorkflow(nil)
+end)
+
+btnLoop.MouseButton1Click:Connect(function()
+	loopEnabled = not loopEnabled
+	btnLoop.Text = "Повторять круг: " .. (loopEnabled and "ВКЛ" or "ВЫКЛ")
+	btnLoop.BackgroundColor3 = loopEnabled and COLOR_ON or COLOR_OFF
+end)
+
+-- Горячая клавиша: показать/скрыть меню
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == HOTKEY then
+		setMenuVisible(not mainFrame.Visible)
+	end
+end))
+
+-- Закрытие: остановить запуск, отключить соединения, удалить GUI
+closeBtn.MouseButton1Click:Connect(function()
+	currentRunId += 1
+	isRunning = false
+	for _, conn in ipairs(connections) do
+		conn:Disconnect()
+	end
+	table.clear(connections)
+	screenGui:Destroy()
 end)
