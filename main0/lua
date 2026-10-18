@@ -1,4 +1,4 @@
--- Standalone LocalScript (без функции дистанции + кнопка генератора)
+-- Standalone LocalScript (без функции дистанции + генератор + коммуникации)
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
@@ -18,8 +18,9 @@ local PIPE_POSITIONS = {
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
 
--- Координаты внешнего генератора
+-- Координаты дополнительного оборудования
 local GENERATOR_POS = Vector3.new(-1714.53, 133.61, 3343.56)
+local COMMUNIC_POS = Vector3.new(-2708.10, 231.62, 3462.68)
 
 -- НАСТРОЙКИ
 local TELEPORT_ATTEMPTS = 5
@@ -69,8 +70,8 @@ openBtn.Parent = screenGui
 Instance.new("UICorner", openBtn).CornerRadius = UDim.new(1, 0)
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 270, 0, 260) -- Увеличили высоту для новой кнопки
-mainFrame.Position = UDim2.new(0, 15, 0.3, 0)
+mainFrame.Size = UDim2.new(0, 270, 0, 300) -- Высота увеличена под 5 кнопок
+mainFrame.Position = UDim2.new(0, 15, 0.25, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.Parent = screenGui
 Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
@@ -96,9 +97,10 @@ minimizeBtn.Font = Enum.Font.SourceSansBold
 minimizeBtn.Parent = mainFrame
 Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0, 4)
 
+-- Кнопка: Старт Все трубы
 local btnAll = Instance.new("TextButton")
 btnAll.Size = UDim2.new(0.9, 0, 0, 32)
-btnAll.Position = UDim2.new(0.05, 0, 0.15, 0)
+btnAll.Position = UDim2.new(0.05, 0, 0.13, 0)
 btnAll.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
 btnAll.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnAll.Text = "Старт: Все трубы"
@@ -107,9 +109,10 @@ btnAll.TextSize = 14
 btnAll.Parent = mainFrame
 Instance.new("UICorner", btnAll).CornerRadius = UDim.new(0, 4)
 
+-- Кнопка: Выбор трубы
 local btnSelect = Instance.new("TextButton")
 btnSelect.Size = UDim2.new(0.9, 0, 0, 32)
-btnSelect.Position = UDim2.new(0.05, 0, 0.29, 0)
+btnSelect.Position = UDim2.new(0.05, 0, 0.26, 0)
 btnSelect.BackgroundColor3 = Color3.fromRGB(40, 100, 180)
 btnSelect.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnSelect.Text = "Выбор трубы"
@@ -118,10 +121,10 @@ btnSelect.TextSize = 14
 btnSelect.Parent = mainFrame
 Instance.new("UICorner", btnSelect).CornerRadius = UDim.new(0, 4)
 
--- Новая кнопка: Генератор внешний
+-- Кнопка: Генератор внешний
 local btnGenerator = Instance.new("TextButton")
 btnGenerator.Size = UDim2.new(0.9, 0, 0, 32)
-btnGenerator.Position = UDim2.new(0.05, 0, 0.43, 0)
+btnGenerator.Position = UDim2.new(0.05, 0, 0.39, 0)
 btnGenerator.BackgroundColor3 = Color3.fromRGB(180, 130, 30)
 btnGenerator.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnGenerator.Text = "ТП: Внешний генератор"
@@ -130,9 +133,22 @@ btnGenerator.TextSize = 14
 btnGenerator.Parent = mainFrame
 Instance.new("UICorner", btnGenerator).CornerRadius = UDim.new(0, 4)
 
+-- Кнопка: Коммуникации
+local btnCommunic = Instance.new("TextButton")
+btnCommunic.Size = UDim2.new(0.9, 0, 0, 32)
+btnCommunic.Position = UDim2.new(0.05, 0, 0.52, 0)
+btnCommunic.BackgroundColor3 = Color3.fromRGB(140, 60, 170)
+btnCommunic.TextColor3 = Color3.fromRGB(255, 255, 255)
+btnCommunic.Text = "ТП: Коммуникации"
+btnCommunic.Font = Enum.Font.SourceSansBold
+btnCommunic.TextSize = 14
+btnCommunic.Parent = mainFrame
+Instance.new("UICorner", btnCommunic).CornerRadius = UDim.new(0, 4)
+
+-- Кнопка: Остановить
 local btnStop = Instance.new("TextButton")
 btnStop.Size = UDim2.new(0.9, 0, 0, 32)
-btnStop.Position = UDim2.new(0.05, 0, 0.57, 0)
+btnStop.Position = UDim2.new(0.05, 0, 0.65, 0)
 btnStop.BackgroundColor3 = Color3.fromRGB(90, 90, 90)
 btnStop.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnStop.Text = "Остановить"
@@ -143,7 +159,7 @@ Instance.new("UICorner", btnStop).CornerRadius = UDim.new(0, 4)
 
 local statusLabel = Instance.new("TextLabel")
 statusLabel.Size = UDim2.new(0.9, 0, 0, 25)
-statusLabel.Position = UDim2.new(0.05, 0, 0.77, 0)
+statusLabel.Position = UDim2.new(0.05, 0, 0.82, 0)
 statusLabel.BackgroundTransparency = 1
 statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
 statusLabel.Text = "Статус: Готов"
@@ -155,7 +171,7 @@ statusLabel.Parent = mainFrame
 -- Окно выборочного списка труб
 local selectFrame = Instance.new("Frame")
 selectFrame.Size = UDim2.new(0, 200, 0, 250)
-selectFrame.Position = UDim2.new(0, 290, 0.3, 0)
+selectFrame.Position = UDim2.new(0, 290, 0.25, 0)
 selectFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 selectFrame.Visible = false
 selectFrame.Parent = screenGui
@@ -173,7 +189,7 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Логика телепортации и атаки
+-- Логика телепортации и атаки для труб
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
@@ -247,8 +263,8 @@ local function runWorkflow(targetPipeIndex)
 	end)
 end
 
--- Функция телепортации к генератору
-local function teleportToGenerator()
+-- Универсальная функция телепортации к одиночной локации
+local function teleportToLocation(targetPos, locationName)
 	currentRunId += 1
 	local myRunId = currentRunId
 	
@@ -259,17 +275,17 @@ local function teleportToGenerator()
 			return 
 		end
 		
-		statusLabel.Text = "ТП к генератору..."
+		statusLabel.Text = "ТП к: " .. locationName
 		
 		for attempt = 1, TELEPORT_ATTEMPTS do
 			if currentRunId ~= myRunId then return end
 			hrp.AssemblyLinearVelocity = Vector3.zero
-			hrp.CFrame = CFrame.new(GENERATOR_POS + Vector3.new(0, 3, 0))
+			hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
 			task.wait(TELEPORT_PAUSE)
 		end
 		
 		if currentRunId == myRunId then
-			statusLabel.Text = "Готово: Внешний генератор"
+			statusLabel.Text = "Готово: " .. locationName
 		end
 	end)
 end
@@ -307,7 +323,11 @@ btnSelect.MouseButton1Click:Connect(function()
 end)
 
 btnGenerator.MouseButton1Click:Connect(function()
-	teleportToGenerator()
+	teleportToLocation(GENERATOR_POS, "Внешний генератор")
+end)
+
+btnCommunic.MouseButton1Click:Connect(function()
+	teleportToLocation(COMMUNIC_POS, "Коммуникации")
 end)
 
 btnStop.MouseButton1Click:Connect(function()
