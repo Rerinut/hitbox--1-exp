@@ -1,6 +1,5 @@
--- Standalone LocalScript (с увеличенной задержкой и многократным удержанием позиции)
+-- Standalone LocalScript (без функции дистанции)
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -19,10 +18,10 @@ local PIPE_POSITIONS = {
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)}
 }
 
--- УВЕЛИЧЕННЫЕ НАСТРОЙКИ ДЛЯ ПРИЦЕЛИВАНИЯ И ОБХОДА АНТИ-ЧИТА
-local TELEPORT_ATTEMPTS = 5   -- Больше попыток закрепиться на точке
-local TELEPORT_PAUSE = 0.8    -- Увеличена пауза между попытками телепорта
-local PIPE_DELAY = 2.0        -- Дополнительная пауза перед атакой, чтобы вы успели прицелиться
+-- НАСТРОЙКИ
+local TELEPORT_ATTEMPTS = 5
+local TELEPORT_PAUSE = 0.8
+local PIPE_DELAY = 2.0
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -67,7 +66,7 @@ openBtn.Parent = screenGui
 Instance.new("UICorner", openBtn).CornerRadius = UDim.new(1, 0)
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 270, 0, 250)
+mainFrame.Size = UDim2.new(0, 270, 0, 220) -- Уменьшена высота окна, так как нет строки дистанции
 mainFrame.Position = UDim2.new(0, 15, 0.3, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.Parent = screenGui
@@ -96,7 +95,7 @@ Instance.new("UICorner", minimizeBtn).CornerRadius = UDim.new(0, 4)
 
 local btnAll = Instance.new("TextButton")
 btnAll.Size = UDim2.new(0.9, 0, 0, 32)
-btnAll.Position = UDim2.new(0.05, 0, 0.16, 0)
+btnAll.Position = UDim2.new(0.05, 0, 0.18, 0)
 btnAll.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
 btnAll.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnAll.Text = "Старт: Все трубы"
@@ -107,7 +106,7 @@ Instance.new("UICorner", btnAll).CornerRadius = UDim.new(0, 4)
 
 local btnSelect = Instance.new("TextButton")
 btnSelect.Size = UDim2.new(0.9, 0, 0, 32)
-btnSelect.Position = UDim2.new(0.05, 0, 0.31, 0)
+btnSelect.Position = UDim2.new(0.05, 0, 0.35, 0)
 btnSelect.BackgroundColor3 = Color3.fromRGB(40, 100, 180)
 btnSelect.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnSelect.Text = "Выбор трубы"
@@ -118,7 +117,7 @@ Instance.new("UICorner", btnSelect).CornerRadius = UDim.new(0, 4)
 
 local btnStop = Instance.new("TextButton")
 btnStop.Size = UDim2.new(0.9, 0, 0, 32)
-btnStop.Position = UDim2.new(0.05, 0, 0.46, 0)
+btnStop.Position = UDim2.new(0.05, 0, 0.52, 0)
 btnStop.BackgroundColor3 = Color3.fromRGB(90, 90, 90)
 btnStop.TextColor3 = Color3.fromRGB(255, 255, 255)
 btnStop.Text = "Остановить"
@@ -128,8 +127,8 @@ btnStop.Parent = mainFrame
 Instance.new("UICorner", btnStop).CornerRadius = UDim.new(0, 4)
 
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Size = UDim2.new(0.9, 0, 0, 20)
-statusLabel.Position = UDim2.new(0.05, 0, 0.63, 0)
+statusLabel.Size = UDim2.new(0.9, 0, 0, 25)
+statusLabel.Position = UDim2.new(0.05, 0, 0.72, 0)
 statusLabel.BackgroundTransparency = 1
 statusLabel.TextColor3 = Color3.fromRGB(220, 220, 220)
 statusLabel.Text = "Статус: Готов"
@@ -137,17 +136,6 @@ statusLabel.Font = Enum.Font.SourceSans
 statusLabel.TextSize = 13
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
 statusLabel.Parent = mainFrame
-
-local distLabel = Instance.new("TextLabel")
-distLabel.Size = UDim2.new(0.9, 0, 0, 20)
-distLabel.Position = UDim2.new(0.05, 0, 0.73, 0)
-distLabel.BackgroundTransparency = 1
-distLabel.TextColor3 = Color3.fromRGB(160, 200, 255)
-distLabel.Text = "Дистанция: -- studs"
-distLabel.Font = Enum.Font.SourceSans
-distLabel.TextSize = 13
-distLabel.TextXAlignment = Enum.TextXAlignment.Left
-distLabel.Parent = mainFrame
 
 -- Окно выборочного списка труб
 local selectFrame = Instance.new("Frame")
@@ -170,28 +158,7 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Трекер расстояния
-local lastUpdate = 0
-RunService.Heartbeat:Connect(function()
-	local now = os.clock()
-	if now - lastUpdate < 0.1 then return end
-	lastUpdate = now
-	
-	if not mainFrame.Visible then return end
-	local _, _, hrp = getCharacterComponents()
-	if not hrp then
-		distLabel.Text = "Дистанция: нет персонажа"
-		return
-	end
-	
-	local target = PIPE_POSITIONS[selectedPipeIndex]
-	if target then
-		local dist = (hrp.Position - target.pos).Magnitude
-		distLabel.Text = string.format("Дистанция (%s): %.1f studs", target.name, dist)
-	end
-end)
-
--- Логика телепортации и атаки с замедлением и многократным удержанием
+-- Логика телепортации и атаки
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
@@ -200,13 +167,10 @@ local function processSinglePipe(pipeData, myRunId)
 	
 	statusLabel.Text = "ТП (удержание): " .. pipeData.name
 	
-	-- Несколько повторных телепортов для преодоления анти-чита
 	for attempt = 1, TELEPORT_ATTEMPTS do
 		if currentRunId ~= myRunId then return false end
-		
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
-		
 		task.wait(TELEPORT_PAUSE)
 	end
 	
@@ -215,12 +179,10 @@ local function processSinglePipe(pipeData, myRunId)
 	
 	safeLookAt(currentHrp, pipeData.pos)
 	
-	-- Дополнительная пауза перед атакой, чтобы вы успели прицелиться
 	statusLabel.Text = "Ожидание / Прицел: " .. pipeData.name
 	task.wait(PIPE_DELAY)
 	if currentRunId ~= myRunId then return false end
 	
-	-- Достаем оружие
 	local equippedTool = char:FindFirstChildOfClass("Tool")
 	if not equippedTool then
 		local backpack = player:FindFirstChild("Backpack")
@@ -246,7 +208,6 @@ local function processSinglePipe(pipeData, myRunId)
 	return true
 end
 
--- Запуск маршрута
 local function runWorkflow(targetPipeIndex)
 	currentRunId += 1
 	local myRunId = currentRunId
@@ -262,7 +223,7 @@ local function runWorkflow(targetPipeIndex)
 				selectedPipeIndex = i
 				local ok = processSinglePipe(pipeData, myRunId)
 				if not ok then break end
-				task.wait(0.5) -- Пауза между переходом к следующей трубе
+				task.wait(0.5)
 			end
 			if currentRunId == myRunId then
 				statusLabel.Text = "Все трубы пройдены!"
