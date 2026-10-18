@@ -1,7 +1,7 @@
--- Naramato Pipe Checker v7: авто-ТП по трубам + проверка по урону (чистая версия)
--- Для проекта, который ты контролируешь (StarterPlayerScripts / LocalScript).
--- Скрипт телепортирует ТОЛЬКО твоего персонажа и следит за его здоровьем.
-
+-- Naramato Pipe Destroyer v8
+-- Телепорт к трубам + уничтожение оружием (как в первой версии),
+-- плюс: повтор круга, продолжение после смерти, прогресс/таймер,
+-- удержание на трубе при откатах сервера, чистый интерфейс.
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -22,31 +22,42 @@ local PIPES = {
 }
 
 -- НАСТРОЙКИ
-local CHECK_SECONDS = 5        -- сколько секунд наблюдать урон на каждой трубе
-local SETTLE_TIME = 0.8        -- после ТП урон не считаем (падение/приземление)
-local TELEPORT_ATTEMPTS = 3    -- первичные повторы ТП (сервер может откатывать)
-local TELEPORT_PAUSE = 0.3
-local TELEPORT_HEIGHT = 3      -- на сколько studs выше точки трубы ставить персонажа
-local HOLD_INTERVAL = 0.25     -- как часто возвращать на трубу при сносе
-local HOLD_RADIUS = 10         -- дальше этого от трубы (по горизонтали) = вернуть
-local RUBBER_LIMIT = 6         -- больше откатов = проверка неполная
-local MAX_RETRIES = 3          -- повторы трубы, если персонаж погиб без урона
-local RESPAWN_TIMEOUT = 30     -- сколько ждать респавн, сек
-local PAUSE_BETWEEN = 0.5      -- пауза между трубами
-local ZONE_RADIUS = 16         -- для ручного режима (без ТП): горизонтальный радиус
-local MAX_HEIGHT_DIFF = 30     -- допустимая разница по высоте
+local TELEPORT_ATTEMPTS = 5     -- сколько раз подряд телепортироваться на трубу
+local TELEPORT_PAUSE = 0.8
+local TELEPORT_HEIGHT = 3       -- на сколько studs выше точки трубы
+local PIPE_DELAY = 2.0          -- пауза перед атакой (прицеливание)
+local EQUIP_LOAD_DELAY = 1.5    -- ожидание загрузки оружия после экипировки
+local ATTACK_COUNT = 5          -- сколько ударов на трубу, если CHECK_BROKEN не задана
+local ATTACK_PAUSE = 0.2
+local ATTACK_MAX_TIME = 20      -- максимум секунд на трубу
+local HOLD_RADIUS = 10          -- дальше этого от трубы (по горизонтали) = вернуть ТП
+local MAX_RETRIES = 3           -- повторы трубы после смерти
+local RESPAWN_TIMEOUT = 30      -- сколько ждать респавн, сек
+local PAUSE_BETWEEN = 0.5       -- пауза между трубами
+local TOOL_NAME = nil           -- например "Hammer"; nil = первое найденное оружие
 local HOTKEY = Enum.KeyCode.RightShift
 
+-- АТАКА ДО РЕЗУЛЬТАТА (необязательно).
+-- Если знаешь, как в игре выглядит сломанная труба, верни true, когда она сломана.
+-- Аргумент: номер трубы (1..10). Пример (подставь свои имена):
+-- local CHECK_BROKEN = function(idx)
+--     local pipe = workspace:FindFirstChild("Pipe" .. idx)
+--     return pipe == nil or pipe:GetAttribute("Health") == 0
+-- end
+local CHECK_BROKEN = nil
+
+-- ЦВЕТА
+local COLOR_ON = Color3.fromRGB(41, 110, 76)
+local COLOR_OFF = Color3.fromRGB(76, 79, 88)
+
 -- СОСТОЯНИЕ
-local statuses = table.create(#PIPES, "Не проверена")
-local details = table.create(#PIPES, "")
-local selected = 1
+local statuses = table.create(#PIPES, "Ожидает")
 local runToken = 0
-local checking = false
-local batchIndex, batchTotal = 0, 0
-local teleportEnabled = true
-local returnEnabled = true
-local summaryText = ""
+local running = false
+local loopEnabled = false
+local returnEnabled = false
+local runStart = 0
+local progIndex, progLap = 0, 0
 local connections = {}
 
 local function listen(signal, callback)
@@ -58,39 +69,59 @@ end
 ----------------------------------------------------------------
 -- Вспомогательные функции
 ----------------------------------------------------------------
-local function characterParts()
-	local c = player.Character
-	if not c then return end
-	local h = c:FindFirstChildOfClass("Humanoid")
-	local root = c:FindFirstChild("HumanoidRootPart")
-	if h and root and h.Health > 0 then return h, root end
+-- Возвращает char, hum, hrp или nil, если персонаж недоступен/мёртв
+local function getCharacter()
+	local char = player.Character
+	if not char then return nil, nil, nil end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hum or hum.Health <= 0 or not hrp then return nil, nil, nil end
+	return char, hum, hrp
 end
 
 local function flatDistance(a, b)
 	return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
 end
 
-local function inZone(root, i)
-	local p = PIPES[i]
-	return flatDistance(root.Position, p) <= ZONE_RADIUS
-		and math.abs(root.Position.Y - p.Y) <= MAX_HEIGHT_DIFF
-end
-
 local function teleportTo(i)
-	local _, root = characterParts()
-	if not root then return false end
-	root.AssemblyLinearVelocity = Vector3.zero
-	root.AssemblyAngularVelocity = Vector3.zero
-	player.Character:PivotTo(CFrame.new(PIPES[i] + Vector3.new(0, TELEPORT_HEIGHT, 0)))
+	local char, _, hrp = getCharacter()
+	if not hrp then return false end
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	hrp.AssemblyAngularVelocity = Vector3.zero
+	char:PivotTo(CFrame.new(PIPES[i] + Vector3.new(0, TELEPORT_HEIGHT, 0)))
 	return true
 end
 
-local function damagedList()
-	local list = {}
-	for i = 1, #PIPES do
-		if statuses[i] == "Урон наблюдался" then table.insert(list, tostring(i)) end
+local function faceTarget(hrp, targetPos)
+	local currentPos = hrp.Position
+	local flatTarget = Vector3.new(targetPos.X, currentPos.Y, targetPos.Z)
+	if (flatTarget - currentPos).Magnitude > 0.1 then
+		hrp.CFrame = CFrame.new(currentPos, flatTarget)
 	end
-	return list
+end
+
+local function findTool(container)
+	if TOOL_NAME then
+		local t = container:FindFirstChild(TOOL_NAME)
+		return (t and t:IsA("Tool")) and t or nil
+	end
+	return container:FindFirstChildOfClass("Tool")
+end
+
+-- Гарантирует, что оружие в руках. nil = нет оружия или персонаж потерян.
+local function ensureTool()
+	local char, hum = getCharacter()
+	if not char then return nil end
+	local tool = findTool(char)
+	if tool then return tool end
+
+	local backpack = player:FindFirstChild("Backpack")
+	tool = backpack and findTool(backpack)
+	if not tool then return nil end
+
+	hum:EquipTool(tool)
+	task.wait(EQUIP_LOAD_DELAY) -- оружие инициализируется при экипировке
+	return (tool.Parent == player.Character) and tool or nil
 end
 
 ----------------------------------------------------------------
@@ -132,15 +163,15 @@ local function btn(parent, label, y, color, side)
 end
 
 local panel = instance("Frame", gui, {
-	Size = UDim2.fromOffset(330, 435),
-	Position = UDim2.new(0, 20, 0.15, 0),
+	Size = UDim2.fromOffset(330, 345),
+	Position = UDim2.new(0, 20, 0.2, 0),
 	BackgroundColor3 = Color3.fromRGB(26, 29, 36), BorderSizePixel = 0,
 })
 instance("UICorner", panel, {CornerRadius = UDim.new(0, 10)})
 
 local header = instance("TextLabel", panel, {
 	Size = UDim2.new(1, -84, 0, 34), Position = UDim2.fromOffset(9, 0),
-	Text = "NARAMATO | Pipe Checker v7", Font = Enum.Font.GothamBold,
+	Text = "Naramato Manager", Font = Enum.Font.GothamBold,
 	TextSize = 14, BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1),
 	TextXAlignment = Enum.TextXAlignment.Left, Active = true,
 })
@@ -160,7 +191,7 @@ local closeButton = instance("TextButton", panel, {
 instance("UICorner", closeButton, {CornerRadius = UDim.new(0, 6)})
 
 local open = instance("TextButton", gui, {
-	Size = UDim2.fromOffset(42, 42), Position = UDim2.new(0, 20, 0.15, 0),
+	Size = UDim2.fromOffset(42, 42), Position = UDim2.new(0, 20, 0.2, 0),
 	Text = "N", TextSize = 20, Visible = false, TextColor3 = Color3.new(1, 1, 1),
 	BackgroundColor3 = Color3.fromRGB(35, 45, 65),
 })
@@ -174,51 +205,269 @@ local choose = instance("ScrollingFrame", panel, {
 })
 instance("UIListLayout", choose, {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder})
 
-local info = instance("TextLabel", panel, {
-	Size = UDim2.new(1, -16, 0, 48), Position = UDim2.fromOffset(8, 161),
-	BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1), TextWrapped = true,
-	TextSize = 12, Font = Enum.Font.Gotham, Text = "Выбери трубу",
+local progressLabel = instance("TextLabel", panel, {
+	Size = UDim2.new(1, -16, 0, 18), Position = UDim2.fromOffset(8, 161),
+	BackgroundTransparency = 1, TextColor3 = Color3.new(1, 1, 1),
+	TextSize = 12, Font = Enum.Font.GothamBold, Text = "Не запущено",
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+
+local statusLabel = instance("TextLabel", panel, {
+	Size = UDim2.new(1, -16, 0, 32), Position = UDim2.fromOffset(8, 181),
+	BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(210, 215, 225), TextWrapped = true,
+	TextSize = 12, Font = Enum.Font.Gotham, Text = "Статус: готов. Нажми на трубу в списке или «Старт».",
 	TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
 })
 
-local checkButton = btn(panel, "Проверить выбранную", 213, Color3.fromRGB(38, 125, 86))
-local checkAllButton = btn(panel, "Проверить ВСЕ трубы (авто-ТП)", 249, Color3.fromRGB(45, 105, 160))
-local nextButton = btn(panel, "Следующая труба", 285)
-local stopButton = btn(panel, "Остановить", 321, Color3.fromRGB(135, 78, 58))
-local resetButton = btn(panel, "Сбросить всё", 357, Color3.fromRGB(95, 60, 60))
-local tpToggle = btn(panel, "ТП: ВКЛ", 393, Color3.fromRGB(41, 110, 76), "left")
-local returnToggle = btn(panel, "Возврат: ВКЛ", 393, Color3.fromRGB(41, 110, 76), "right")
+local btnAll = btn(panel, "Старт: Все трубы", 217, Color3.fromRGB(180, 50, 50))
+local btnStop = btn(panel, "Остановить", 253, Color3.fromRGB(90, 90, 90))
+local btnLoop = btn(panel, "Повтор круга: ВЫКЛ", 289, COLOR_OFF, "left")
+local btnReturn = btn(panel, "Возврат: ВЫКЛ", 289, COLOR_OFF, "right")
 
 ----------------------------------------------------------------
 -- Обновление отображения
 ----------------------------------------------------------------
-local buttons = {}
+local pipeButtons = {}
 
-local function updateInfo()
-	if checking then return end
-	if summaryText ~= "" then
-		info.Text = summaryText
-		return
-	end
-	local second = statuses[selected]
-	if details[selected] ~= "" then second = second .. " | " .. details[selected] end
-	info.Text = string.format("Труба %d\n%s", selected, second)
+local function setStatus(text)
+	statusLabel.Text = text
 end
 
 local function refresh()
-	updateInfo()
-	for i, b in ipairs(buttons) do
-		local color = Color3.fromRGB(76, 79, 88)
-		if statuses[i] == "Урон наблюдался" then color = Color3.fromRGB(130, 63, 60)
-		elseif statuses[i] == "Урон не наблюдался" then color = Color3.fromRGB(41, 110, 76)
-		elseif statuses[i] == "Проверка неполная" then color = Color3.fromRGB(135, 100, 42)
-		elseif statuses[i] == "Проверяется" then color = Color3.fromRGB(60, 90, 140) end
-		if i == selected then color = Color3.fromRGB(49, 98, 170) end
+	for i, b in ipairs(pipeButtons) do
+		local color = Color3.fromRGB(70, 75, 86)
+		local s = statuses[i]
+		if s == "Готово" then color = Color3.fromRGB(41, 110, 76)
+		elseif s == "В работе" then color = Color3.fromRGB(49, 98, 170)
+		elseif s == "Прервано" or s == "Нет оружия" then color = Color3.fromRGB(135, 100, 42) end
 		b.BackgroundColor3 = color
-		b.Text = string.format("%d | %s", i, statuses[i])
+		b.Text = string.format("Труба %d | %s", i, s)
 	end
 end
 
+local function updateProgress()
+	if progIndex == 0 then
+		progressLabel.Text = "Не запущено"
+		return
+	end
+	local elapsed = math.floor(os.clock() - runStart)
+	local text = string.format("Труба %d/%d", progIndex, #PIPES)
+	if progLap > 0 then text = text .. string.format(" · круг %d", progLap) end
+	text = text .. string.format(" · %02d:%02d", math.floor(elapsed / 60), elapsed % 60)
+	progressLabel.Text = text
+end
+
+-- Таймер раз в секунду, пока идёт запуск
+task.spawn(function()
+	while gui.Parent do
+		if running then updateProgress() end
+		task.wait(1)
+	end
+end)
+
+----------------------------------------------------------------
+-- Уничтожение одной трубы
+-- Возвращает: "done" | "cancelled" | "lost" | "notool"
+----------------------------------------------------------------
+local function processPipe(idx, token)
+	local function cancelled() return runToken ~= token end
+	if cancelled() then return "cancelled" end
+
+	local label = "Труба " .. idx
+	statuses[idx] = "В работе"
+	refresh()
+
+	-- 1) телепорт (несколько попыток подряд: сервер может откатывать)
+	setStatus("ТП (удержание): " .. label)
+	for _ = 1, TELEPORT_ATTEMPTS do
+		if cancelled() then return "cancelled" end
+		if not teleportTo(idx) then return "lost" end
+		task.wait(TELEPORT_PAUSE)
+	end
+
+	-- 2) прицел
+	local _, _, hrp = getCharacter()
+	if not hrp then return "lost" end
+	faceTarget(hrp, PIPES[idx])
+	setStatus("Прицел: " .. label)
+	task.wait(PIPE_DELAY)
+	if cancelled() then return "cancelled" end
+
+	-- 3) оружие
+	setStatus("Оружие: " .. label)
+	local tool = ensureTool()
+	if not tool then
+		return getCharacter() and "notool" or "lost"
+	end
+
+	-- 4) атака с удержанием позиции
+	local startT = os.clock()
+	local hits, rubber = 0, 0
+	while true do
+		if cancelled() then return "cancelled" end
+		local _, _, r = getCharacter()
+		if not r then return "lost" end
+
+		-- сервер мог откатить назад: возвращаем на трубу
+		if flatDistance(r.Position, PIPES[idx]) > HOLD_RADIUS then
+			rubber += 1
+			teleportTo(idx)
+			task.wait(0.15)
+			local _, _, r2 = getCharacter()
+			if r2 then faceTarget(r2, PIPES[idx]) end
+		end
+
+		if CHECK_BROKEN then
+			local okc, broken = pcall(CHECK_BROKEN, idx)
+			if okc and broken then break end
+		elseif hits >= ATTACK_COUNT then
+			break
+		end
+		if os.clock() - startT >= ATTACK_MAX_TIME then break end
+
+		tool = ensureTool() -- оружие могло слететь
+		if not tool then
+			return getCharacter() and "notool" or "lost"
+		end
+		pcall(function() tool:Activate() end)
+		hits += 1
+		setStatus(string.format("Атака: %s · удар %d%s", label, hits,
+			rubber > 0 and (" · откатов ТП: " .. rubber) or ""))
+		task.wait(ATTACK_PAUSE)
+	end
+
+	return "done"
+end
+
+-- Обёртка: после смерти ждём респавн и повторяем ту же трубу
+-- Возвращает: "done" | "cancelled" | "failed" | "notool" | "gaveup"
+local function processWithRetry(idx, token)
+	for attempt = 1, MAX_RETRIES do
+		local result = processPipe(idx, token)
+		if result ~= "lost" then return result end
+
+		setStatus(string.format("Персонаж потерян, жду респавн (%d/%d)", attempt, MAX_RETRIES))
+		local waited = 0
+		while waited < RESPAWN_TIMEOUT and not getCharacter() do
+			if runToken ~= token then return "cancelled" end
+			task.wait(0.5)
+			waited += 0.5
+		end
+		if not getCharacter() then return "failed" end
+		task.wait(1)
+	end
+	return "gaveup"
+end
+
+----------------------------------------------------------------
+-- Запуск
+----------------------------------------------------------------
+local function returnHome(pivot)
+	if not (returnEnabled and pivot) then return end
+	for _ = 1, 2 do
+		local char, _, hrp = getCharacter()
+		if not hrp then return end
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		char:PivotTo(pivot)
+		task.wait(0.3)
+	end
+end
+
+local function runWorkflow(list, allowLoop)
+	if running then return end
+	if not getCharacter() then
+		setStatus("Персонаж недоступен")
+		return
+	end
+
+	runToken += 1
+	local token = runToken
+	running = true
+	runStart = os.clock()
+	progLap = 0
+	progIndex = 0
+	local startPivot = player.Character:GetPivot()
+	local finalText = "Готово"
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local keepGoing = true
+			local lap = 0
+			while keepGoing do
+				lap += 1
+				progLap = allowLoop and lap or 0
+				if lap > 1 then
+					for i = 1, #PIPES do statuses[i] = "Ожидает" end
+					refresh()
+				end
+
+				for n, idx in ipairs(list) do
+					if runToken ~= token then return end
+					progIndex = idx
+					updateProgress()
+
+					local result = processWithRetry(idx, token)
+					if result == "done" then
+						statuses[idx] = "Готово"
+						setStatus("Готово: Труба " .. idx)
+					elseif result == "cancelled" then
+						return
+					elseif result == "notool" then
+						statuses[idx] = "Нет оружия"
+						finalText = "Нет оружия в рюкзаке — остановлено"
+						return
+					elseif result == "failed" then
+						statuses[idx] = "Прервано"
+						finalText = "Не дождался респавна — остановлено"
+						return
+					else -- gaveup
+						statuses[idx] = "Прервано"
+						setStatus(string.format("Труба %d: персонаж погиб %d раз подряд", idx, MAX_RETRIES))
+					end
+					refresh()
+					task.wait(PAUSE_BETWEEN)
+				end
+
+				if runToken ~= token then return end
+				keepGoing = allowLoop and loopEnabled
+				if keepGoing then
+					setStatus("Круг " .. lap .. " пройден, начинаю новый")
+					task.wait(1)
+				else
+					finalText = (#list > 1) and "Все трубы пройдены!" or finalText
+				end
+			end
+		end)
+
+		-- завершение (в том числе после остановки)
+		for i = 1, #PIPES do
+			if statuses[i] == "В работе" then statuses[i] = "Прервано" end
+		end
+		returnHome(startPivot)
+		running = false
+		updateProgress()
+		refresh()
+
+		if not ok then
+			setStatus("Ошибка: " .. tostring(err))
+		elseif runToken ~= token then
+			setStatus("Остановлено")
+		else
+			setStatus(finalText)
+		end
+	end)
+end
+
+local function stop()
+	if running then
+		runToken += 1 -- поток сам завершится, вернёт на место и снимет флаг running
+		setStatus("Останавливаю...")
+	end
+end
+
+----------------------------------------------------------------
+-- Кнопки
+----------------------------------------------------------------
 for i = 1, #PIPES do
 	local index = i
 	local b = instance("TextButton", choose, {
@@ -227,280 +476,30 @@ for i = 1, #PIPES do
 		BackgroundColor3 = Color3.fromRGB(70, 75, 86),
 	})
 	instance("UICorner", b, {CornerRadius = UDim.new(0, 5)})
-	buttons[i] = b
+	pipeButtons[i] = b
 	listen(b.MouseButton1Click, function()
-		if checking then return end
-		selected = index
-		summaryText = ""
-		refresh()
+		runWorkflow({index}, false) -- клик по трубе = уничтожить только её
 	end)
 end
 
-----------------------------------------------------------------
--- Проверка одной трубы
--- Возвращает: "done" | "cancelled" | "lost"
-----------------------------------------------------------------
-local function finishPipe(idx, status, detail)
-	statuses[idx] = status
-	details[idx] = detail
-	refresh()
-end
-
-local function damageDetail(damage, firstHit, peak, rubber)
-	local s = string.format("%.1f HP · 1-й %.1fс · пик %.1f", damage, firstHit or 0, peak)
-	if rubber > 0 then s = s .. string.format(" · откатов %d", rubber) end
-	return s
-end
-
-local function checkPipe(idx, token)
-	local function cancelled() return runToken ~= token end
-	if cancelled() then return "cancelled" end
-
-	statuses[idx] = "Проверяется"
-	details[idx] = ""
-	refresh()
-
-	-- 1) телепорт (несколько попыток подряд)
-	if teleportEnabled then
-		for _ = 1, TELEPORT_ATTEMPTS do
-			if cancelled() then return "cancelled" end
-			if not teleportTo(idx) then return "lost" end
-			task.wait(TELEPORT_PAUSE)
-		end
-	end
-
-	local humanoid, root = characterParts()
-	if not humanoid or not root then return "lost" end
-
-	if not inZone(root, idx) and not (teleportEnabled and flatDistance(root.Position, PIPES[idx]) <= HOLD_RADIUS) then
-		finishPipe(idx, "Проверка неполная",
-			teleportEnabled and "ТП не сработало (сервер вернул назад)" or "далеко от трубы")
-		return "done"
-	end
-
-	-- 2) наблюдение
-	local initialChar = player.Character
-	local settle = teleportEnabled and SETTLE_TIME or 0
-	local total = settle + CHECK_SECONDS
-	local lastHealth = humanoid.Health
-	local damage, peak, firstHit, rubber = 0, 0, nil, 0
-	local t, holdTimer = 0, 0
-
-	while t < total do
-		local dt = RunService.Heartbeat:Wait()
-		if cancelled() then return "cancelled" end
-		t += dt
-
-		-- здоровье читаем с сохранённого Humanoid: так видно и последний удар перед смертью
-		local hp = humanoid.Health
-		if t <= settle then
-			lastHealth = hp -- стабилизация: приземление не считаем уроном трубы
-		else
-			if hp < lastHealth then
-				local hit = lastHealth - hp
-				damage += hit
-				peak = math.max(peak, hit)
-				firstHit = firstHit or (t - settle)
-			end
-			lastHealth = hp
-		end
-
-		local h, r = characterParts()
-		if player.Character ~= initialChar or h ~= humanoid or not r then
-			if damage > 0 then
-				finishPipe(idx, "Урон наблюдался",
-					damageDetail(damage, firstHit, peak, rubber) .. " · персонаж погиб")
-				return "done"
-			end
-			return "lost"
-		end
-
-		if teleportEnabled then
-			holdTimer += dt
-			if holdTimer >= HOLD_INTERVAL then
-				holdTimer = 0
-				if flatDistance(r.Position, PIPES[idx]) > HOLD_RADIUS then
-					rubber += 1
-					teleportTo(idx)
-				end
-			end
-		elseif not inZone(r, idx) then
-			finishPipe(idx, "Проверка неполная", "персонаж вышел из зоны")
-			return "done"
-		end
-
-		local phase = (t <= settle) and "стабилизация после ТП"
-			or string.format("наблюдение %.1f/%.0f с", t - settle, CHECK_SECONDS)
-		info.Text = string.format("[%d/%d] Труба %d · %s\nУрон: %.1f HP · откатов ТП: %d",
-			batchIndex, batchTotal, idx, phase, damage, rubber)
-	end
-
-	-- 3) вердикт
-	if rubber > RUBBER_LIMIT then
-		local extra = damage > 0 and string.format(" (урон %.1f HP)", damage) or ""
-		finishPipe(idx, "Проверка неполная",
-			string.format("сервер возвращал назад %d раз", rubber) .. extra)
-	elseif damage > 0 then
-		finishPipe(idx, "Урон наблюдался", damageDetail(damage, firstHit, peak, rubber))
-	else
-		local s = string.format("0 HP за %.0f сек", CHECK_SECONDS)
-		if rubber > 0 then s = s .. string.format(" · откатов %d", rubber) end
-		finishPipe(idx, "Урон не наблюдался", s)
-	end
-	return "done"
-end
-
--- Обёртка: если персонаж погиб без урона — ждём респавн и повторяем ту же трубу
--- Возвращает: "done" | "cancelled" | "failed"
-local function checkWithRetry(idx, token)
-	for attempt = 1, MAX_RETRIES do
-		local result = checkPipe(idx, token)
-		if result ~= "lost" then return result end
-
-		statuses[idx] = "Проверка неполная"
-		details[idx] = string.format("персонаж погиб, повтор %d/%d", attempt, MAX_RETRIES)
-		refresh()
-
-		local waited = 0
-		while waited < RESPAWN_TIMEOUT and not characterParts() do
-			if runToken ~= token then return "cancelled" end
-			task.wait(0.5)
-			waited += 0.5
-		end
-		if not characterParts() then return "failed" end
-		task.wait(1)
-	end
-	finishPipe(idx, "Проверка неполная", string.format("персонаж погиб %d раз подряд", MAX_RETRIES))
-	return "done"
-end
-
-----------------------------------------------------------------
--- Запуск пачки проверок
-----------------------------------------------------------------
-local function returnHome(pivot)
-	if not (returnEnabled and pivot) then return end
-	for _ = 1, 2 do
-		local _, root = characterParts()
-		if not root then return end
-		root.AssemblyLinearVelocity = Vector3.zero
-		player.Character:PivotTo(pivot)
-		task.wait(0.3)
-	end
-end
-
-local function runWorkflow(list)
-	if checking then return end
-	if #list == 0 then return end
-
-	local humanoid, root = characterParts()
-	if not humanoid or not root then
-		info.Text = "Персонаж недоступен"
-		return
-	end
-	if not teleportEnabled then
-		if #list > 1 then
-			info.Text = "Для проверки всех труб включи ТП"
-			return
-		end
-		if not inZone(root, list[1]) then
-			info.Text = string.format("Подойди к трубе %d ближе %.0f studs или включи ТП", list[1], ZONE_RADIUS)
-			return
-		end
-	end
-
-	runToken += 1
-	local token = runToken
-	checking = true
-	batchTotal = #list
-	summaryText = ""
-	local startPivot = player.Character:GetPivot()
-
-	task.spawn(function()
-		local ok, err = pcall(function()
-			for n, idx in ipairs(list) do
-				if runToken ~= token then break end
-				selected = idx
-				batchIndex = n
-				local result = checkWithRetry(idx, token)
-				if result == "cancelled" then
-					if statuses[idx] == "Проверяется" then
-						statuses[idx] = "Проверка неполная"
-						details[idx] = "остановлена"
-					end
-					break
-				elseif result == "failed" then
-					statuses[idx] = "Проверка неполная"
-					details[idx] = "не дождался респавна"
-					break
-				end
-				task.wait(PAUSE_BETWEEN)
-			end
-		end)
-
-		returnHome(startPivot)
-		checking = false
-		batchIndex = 0
-
-		if not ok then
-			info.Text = "Ошибка: " .. tostring(err)
-		elseif #list > 1 then
-			local hit = damagedList()
-			summaryText = "Итог: урон на трубах " .. (#hit > 0 and table.concat(hit, ", ") or "не наблюдался")
-		end
-		refresh()
-	end)
-end
-
-local function stop()
-	if checking then
-		runToken += 1 -- поток сам завершится, вернёт на место и снимет флаг checking
-	end
-end
-
-----------------------------------------------------------------
--- Кнопки
-----------------------------------------------------------------
-listen(checkButton.MouseButton1Click, function()
-	runWorkflow({selected})
-end)
-
-listen(checkAllButton.MouseButton1Click, function()
+listen(btnAll.MouseButton1Click, function()
 	local all = {}
 	for i = 1, #PIPES do table.insert(all, i) end
-	runWorkflow(all)
+	runWorkflow(all, true)
 end)
 
-listen(stopButton.MouseButton1Click, stop)
+listen(btnStop.MouseButton1Click, stop)
 
-listen(nextButton.MouseButton1Click, function()
-	if checking then return end
-	selected = selected % #PIPES + 1
-	summaryText = ""
-	refresh()
+listen(btnLoop.MouseButton1Click, function()
+	loopEnabled = not loopEnabled
+	btnLoop.Text = "Повтор круга: " .. (loopEnabled and "ВКЛ" or "ВЫКЛ")
+	btnLoop.BackgroundColor3 = loopEnabled and COLOR_ON or COLOR_OFF
 end)
 
-listen(resetButton.MouseButton1Click, function()
-	if checking then return end
-	for i = 1, #PIPES do
-		statuses[i] = "Не проверена"
-		details[i] = ""
-	end
-	summaryText = ""
-	refresh()
-end)
-
-listen(tpToggle.MouseButton1Click, function()
-	if checking then return end
-	teleportEnabled = not teleportEnabled
-	tpToggle.Text = "ТП: " .. (teleportEnabled and "ВКЛ" or "ВЫКЛ")
-	tpToggle.BackgroundColor3 = teleportEnabled and Color3.fromRGB(41, 110, 76) or Color3.fromRGB(76, 79, 88)
-end)
-
-listen(returnToggle.MouseButton1Click, function()
-	if checking then return end
+listen(btnReturn.MouseButton1Click, function()
 	returnEnabled = not returnEnabled
-	returnToggle.Text = "Возврат: " .. (returnEnabled and "ВКЛ" or "ВЫКЛ")
-	returnToggle.BackgroundColor3 = returnEnabled and Color3.fromRGB(41, 110, 76) or Color3.fromRGB(76, 79, 88)
+	btnReturn.Text = "Возврат: " .. (returnEnabled and "ВКЛ" or "ВЫКЛ")
+	btnReturn.BackgroundColor3 = returnEnabled and COLOR_ON or COLOR_OFF
 end)
 
 listen(minimize.MouseButton1Click, function()
