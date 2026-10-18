@@ -1,4 +1,4 @@
--- Standalone LocalScript (без функции дистанции + генератор + коммуникации)
+-- Standalone LocalScript (Исправлен урон по трубам + Генератор + Коммуникации)
 local Players = game:GetService("Players")
 
 local player = Players.LocalPlayer
@@ -25,7 +25,7 @@ local COMMUNIC_POS = Vector3.new(-2708.10, 231.62, 3462.68)
 -- НАСТРОЙКИ
 local TELEPORT_ATTEMPTS = 5
 local TELEPORT_PAUSE = 0.8
-local PIPE_DELAY = 2.0
+local PIPE_DELAY = 1.0
 
 local currentRunId = 0
 local selectedPipeIndex = 1
@@ -37,14 +37,6 @@ local function getCharacterComponents()
 	local hrp = char:FindFirstChild("HumanoidRootPart")
 	if not hum or hum.Health <= 0 or not hrp then return nil, nil, nil end
 	return char, hum, hrp
-end
-
-local function safeLookAt(hrp, targetPos)
-	local currentPos = hrp.Position
-	local flatTarget = Vector3.new(targetPos.X, currentPos.Y, targetPos.Z)
-	if (flatTarget - currentPos).Magnitude > 0.1 then
-		hrp.CFrame = CFrame.new(currentPos, flatTarget)
-	end
 end
 
 -- Очистка старого интерфейса
@@ -70,7 +62,7 @@ openBtn.Parent = screenGui
 Instance.new("UICorner", openBtn).CornerRadius = UDim.new(1, 0)
 
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 270, 0, 300) -- Высота увеличена под 5 кнопок
+mainFrame.Size = UDim2.new(0, 270, 0, 300)
 mainFrame.Position = UDim2.new(0, 15, 0.25, 0)
 mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
 mainFrame.Parent = screenGui
@@ -189,7 +181,7 @@ local listLayout = Instance.new("UIListLayout")
 listLayout.Padding = UDim.new(0, 4)
 listLayout.Parent = scrollList
 
--- Логика телепортации и атаки для труб
+-- Исправленная логика телепортации и точной регистрации урона
 local function processSinglePipe(pipeData, myRunId)
 	if currentRunId ~= myRunId then return false end
 	
@@ -201,17 +193,18 @@ local function processSinglePipe(pipeData, myRunId)
 	for attempt = 1, TELEPORT_ATTEMPTS do
 		if currentRunId ~= myRunId then return false end
 		hrp.AssemblyLinearVelocity = Vector3.zero
-		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 3, 0))
+		hrp.CFrame = CFrame.new(pipeData.pos + Vector3.new(0, 2, 0))
 		task.wait(TELEPORT_PAUSE)
 	end
 	
 	local _, _, currentHrp = getCharacterComponents()
 	if not currentHrp then return false end
 	
-	safeLookAt(currentHrp, pipeData.pos)
+	-- Точный разворот прямо на центр трубы (включая высоту Y)
+	currentHrp.CFrame = CFrame.new(currentHrp.Position, pipeData.pos)
 	
-	statusLabel.Text = "Ожидание / Прицел: " .. pipeData.name
-	task.wait(PIPE_DELAY)
+	statusLabel.Text = "Ожидание / Синхронизация"
+	task.wait(0.5) -- Ожидание отклика сервера перед ударом
 	if currentRunId ~= myRunId then return false end
 	
 	local equippedTool = char:FindFirstChildOfClass("Tool")
@@ -221,7 +214,7 @@ local function processSinglePipe(pipeData, myRunId)
 			equippedTool = backpack:FindFirstChildOfClass("Tool")
 			if equippedTool and hum then
 				hum:EquipTool(equippedTool)
-				task.wait(0.2)
+				task.wait(0.3)
 			end
 		end
 	end
@@ -230,8 +223,12 @@ local function processSinglePipe(pipeData, myRunId)
 	if equippedTool then
 		for _ = 1, 5 do
 			if currentRunId ~= myRunId then return false end
+			-- Поддерживаем точный прицел на трубу во время ударов
+			if currentHrp then
+				currentHrp.CFrame = CFrame.new(currentHrp.Position, pipeData.pos)
+			end
 			pcall(function() equippedTool:Activate() end)
-			task.wait(0.2)
+			task.wait(0.35) -- Увеличенный интервал для корректной регистрации урона сервером
 		end
 	end
 	
@@ -263,7 +260,7 @@ local function runWorkflow(targetPipeIndex)
 	end)
 end
 
--- Универсальная функция телепортации к одиночной локации
+-- Функция телепортации к одиночной локации
 local function teleportToLocation(targetPos, locationName)
 	currentRunId += 1
 	local myRunId = currentRunId
@@ -327,6 +324,7 @@ btnGenerator.MouseButton1Click:Connect(function()
 end)
 
 btnCommunic.MouseButton1Click:Connect(function()
+	teleportWindowPos = nil
 	teleportToLocation(COMMUNIC_POS, "Коммуникации")
 end)
 
