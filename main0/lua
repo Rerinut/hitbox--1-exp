@@ -1,4 +1,4 @@
--- Standalone LocalScript: Naramato Manager v2 (Strict Verified Pipe Damage Lock)
+-- Standalone LocalScript: Naramato Manager v2 (Strict Verified Pipe Damage Lock + Timed Hold on Gen/Comm)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -10,10 +10,11 @@ local playerGui = player:WaitForChild("PlayerGui")
 -- НАСТРОЙКИ И КООРДИНАТЫ
 --------------------------------------------------------------------
 local CONFIG = {
-	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте у трубы
+	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте у точки
 	TP_LOOP_INTERVAL = 0.04,       -- частота удержания позиции (сек)
 	STABILIZE_TIME = 0.8,          -- сколько сек нужно простоять у новой трубы без отката до включения датчика
-	MAX_VALID_DIST = 4.5,          -- макс. радиус от трубы, внутри которого урон считается валидным
+	SPECIAL_HOLD_TIME = 5.0,       -- время удержания (сек) на Генераторе и Коммуникациях (4-6 сек)
+	MAX_VALID_DIST = 4.5,          -- макс. радиус от точки, внутри которого позиция считается стабильной
 	JIGGLE_RADIUS = 0.25,          -- микро-смещение для срабатывания серверного .Touched трубы
 	HIT_INTERVAL = 0.35,           -- интервал ударов инструментом (сек)
 	DAMAGE_EPSILON = 0.1,          -- минимальный урон для срабатывания датчика
@@ -55,7 +56,9 @@ local THEME = {
 }
 
 local isRunning = false
+local isBusy = false          -- рабочий поток еще не завершился
 local noclipConn = nil
+local noclipChanged = {}      -- части, у которых мы отключили CanCollide
 
 --------------------------------------------------------------------
 -- ФИЗИКА И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -65,18 +68,30 @@ local function setNoClip(state)
 		noclipConn:Disconnect()
 		noclipConn = nil
 	end
+
 	if state then
 		noclipConn = RunService.Stepped:Connect(function()
 			local char = player.Character
 			if char then
 				for _, part in ipairs(char:GetDescendants()) do
 					if part:IsA("BasePart") then
-						part.CanCollide = false
+						if part.CanCollide then
+							noclipChanged[part] = true
+							part.CanCollide = false
+						end
 						part.CanTouch = true -- Гарантируем работу .Touched для получения урона от трубы
 					end
 				end
 			end
 		end)
+	else
+		-- Возвращаем коллизии, которые отключили сами
+		for part in pairs(noclipChanged) do
+			if part.Parent then
+				part.CanCollide = true
+			end
+		end
+		table.clear(noclipChanged)
 	end
 end
 
@@ -85,6 +100,20 @@ local function getCharParts()
 	local hrp = char:WaitForChild("HumanoidRootPart", 10)
 	local hum = char:WaitForChild("Humanoid", 10)
 	return char, hrp, hum
+end
+
+-- Ожидание появления живого персонажа (с учетом остановки)
+local function waitForRespawn()
+	while isRunning do
+		local char = player.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		if hum and hrp and hum.Health > 0 then
+			task.wait(1.2)
+			return
+		end
+		task.wait(0.25)
+	end
 end
 
 local function equipTool()
@@ -96,7 +125,12 @@ local function equipTool()
 	local backpack = player:FindFirstChild("Backpack")
 	if not backpack then return nil end
 
-	tool = CONFIG.TOOL_NAME and backpack:FindFirstChild(CONFIG.TOOL_NAME) or backpack:FindFirstChildOfClass("Tool")
+	if CONFIG.TOOL_NAME then
+		tool = backpack:FindFirstChild(CONFIG.TOOL_NAME)
+	else
+		tool = backpack:FindFirstChildOfClass("Tool")
+	end
+
 	if tool then
 		tool.Parent = char
 		return tool
@@ -104,21 +138,58 @@ local function equipTool()
 	return nil
 end
 
-local function quickTeleport(targetPos)
-	local _, hrp, hum = getCharParts()
-	if not hrp or not hum or hum.Health <= 0 then return end
-
+--------------------------------------------------------------------
+-- УДЕРЖАНИЕ ПО ВРЕМЕНИ (ДЛЯ ГЕНЕРАТОРА И КОММУНИКАЦИЙ)
+--------------------------------------------------------------------
+local function holdAtPointTimed(targetPos, pointName, duration, updateStatus)
 	pcall(function()
 		player:RequestStreamAroundAsync(targetPos, CONFIG.STREAM_TIMEOUT)
 	end)
 
-	local dest = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
-	for _ = 1, 6 do
-		hrp.CFrame = dest
+	local basePos = targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
+	local destCFrame = CFrame.new(basePos)
+	local heldTime = 0
+	local lastTick = tick()
+
+	setNoClip(true)
+
+	while isRunning and heldTime < duration do
+		local _, hrp, hum = getCharParts()
+		if not hrp or not hum or hum.Health <= 0 or not hrp.Parent then
+			break
+		end
+
+		local now = tick()
+		local dt = now - lastTick
+		lastTick = now
+
+		-- Проверяем, не отбросил ли сервер: засчитываем время только когда персонаж реально на точке
+		local currentDist = (hrp.Position - basePos).Magnitude
+		if currentDist <= CONFIG.MAX_VALID_DIST then
+			heldTime = heldTime + dt
+			local remaining = math.max(0, duration - heldTime)
+			updateStatus(string.format("%s: удержание (%.1fс)...", pointName, remaining), THEME.btnSpecial)
+		else
+			updateStatus(string.format("%s: откат! Возвращаем...", pointName), THEME.statusWarn)
+		end
+
+		hrp.CFrame = destCFrame
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
-		task.wait(0.03)
+
+		task.wait(CONFIG.TP_LOOP_INTERVAL)
 	end
+
+	setNoClip(false)
+
+	-- Финальное гашение скорости после отпускания
+	local _, hrp = getCharParts()
+	if hrp and hrp.Parent then
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
+
+	return heldTime >= duration
 end
 
 --------------------------------------------------------------------
@@ -141,8 +212,7 @@ local function teleportUntilVerifiedDamage(pipe, updateStatus)
 		-- Если персонаж погиб, ждем респавна и остаемся на ЭТОЙ ЖЕ трубе
 		if hum.Health <= 0 then
 			updateStatus("Смерть! Ждем респавн для " .. pipe.name, THEME.statusWarn)
-			player.CharacterAdded:Wait()
-			task.wait(1.2)
+			waitForRespawn()
 			continue
 		end
 
@@ -161,350 +231,4 @@ local function teleportUntilVerifiedDamage(pipe, updateStatus)
 			local distToPipe = (hrp.Position - basePos).Magnitude
 			local isAtPipe = distToPipe <= CONFIG.MAX_VALID_DIST
 
-			if sensorArmed and isAtPipe and (lastHealth - newHealth) >= CONFIG.DAMAGE_EPSILON then
-				tookVerifiedDamage = true
-			else
-				-- Игнорируем ложный/остаточный урон и обновляем базу ХП
-				lastHealth = newHealth
-			end
-		end)
-
-		setNoClip(true)
-
-		while isRunning and not tookVerifiedDamage and hum.Health > 0 do
-			-- Проверяем, не отбросил ли нас сервер ДО следующего принудительного ТП
-			local currentDist = (hrp.Position - basePos).Magnitude
-			if currentDist > CONFIG.MAX_VALID_DIST then
-				-- Нас откатило! Сбрасываем таймер стабилизации и блокируем датчик
-				sensorArmed = false
-				stableSince = tick()
-				lastHealth = hum.Health
-				updateStatus(string.format("%s: откат! Возвращаем...", pipe.name), THEME.statusWarn)
-			else
-				-- Мы находимся у трубы: проверяем, прошло ли время стабилизации
-				if not sensorArmed then
-					local elapsed = tick() - stableSince
-					if elapsed >= CONFIG.STABILIZE_TIME then
-						sensorArmed = true
-						lastHealth = hum.Health
-						updateStatus(string.format("%s: датчик активен, ждем урон", pipe.name), THEME.statusOk)
-					else
-						updateStatus(string.format("%s: закрепление (%.1fс)...", pipe.name, CONFIG.STABILIZE_TIME - elapsed), THEME.btnAction)
-					end
-				end
-			end
-
-			-- Микро-колебание на месте, чтобы физика Roblox вызывала .Touched у трубы
-			stepAngle = stepAngle + 1.2
-			local jiggleOffset = Vector3.new(
-				math.cos(stepAngle) * CONFIG.JIGGLE_RADIUS,
-				0,
-				math.sin(stepAngle) * CONFIG.JIGGLE_RADIUS
-			)
-
-			hrp.CFrame = CFrame.new(basePos + jiggleOffset)
-			hrp.AssemblyLinearVelocity = Vector3.zero
-			hrp.AssemblyAngularVelocity = Vector3.zero
-
-			-- Автоудар инструментом
-			if tick() - lastHit >= CONFIG.HIT_INTERVAL then
-				lastHit = tick()
-				local tool = equipTool()
-				if tool then tool:Activate() end
-			end
-
-			task.wait(CONFIG.TP_LOOP_INTERVAL)
-		end
-
-		if healthConn then healthConn:Disconnect() end
-		setNoClip(false)
-
-		if tookVerifiedDamage then
-			updateStatus(string.format("Урон от %s подтвержден!", pipe.name), THEME.statusOk)
-			task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
-			return true
-		end
-	end
-
-	return false
-end
-
---------------------------------------------------------------------
--- ИНТЕРФЕЙС
---------------------------------------------------------------------
-local oldGui = playerGui:FindFirstChild("PipeNavigatorGui")
-if oldGui then oldGui:Destroy() end
-
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "PipeNavigatorGui"
-screenGui.ResetOnSpawn = false
-screenGui.Parent = playerGui
-
-local function round(obj, r)
-	local c = Instance.new("UICorner")
-	c.CornerRadius = UDim.new(0, r or 8)
-	c.Parent = obj
-end
-
-local function stroke(obj, color, thickness)
-	local s = Instance.new("UIStroke")
-	s.Color = color or THEME.stroke
-	s.Thickness = thickness or 1
-	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	s.Parent = obj
-end
-
-local openBtn = Instance.new("TextButton")
-openBtn.Size = UDim2.new(0, 85, 0, 32)
-openBtn.Position = UDim2.new(0, 20, 0.45, 0)
-openBtn.BackgroundColor3 = THEME.bg
-openBtn.TextColor3 = THEME.text
-openBtn.Text = "⚡ Меню"
-openBtn.Font = Enum.Font.GothamBold
-openBtn.TextSize = 13
-openBtn.Visible = false
-openBtn.Parent = screenGui
-round(openBtn, 16)
-stroke(openBtn, THEME.stroke, 1.5)
-
-local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 290, 0, 0)
-mainFrame.AutomaticSize = Enum.AutomaticSize.Y
-mainFrame.Position = UDim2.new(0, 25, 0.22, 0)
-mainFrame.BackgroundColor3 = THEME.bg
-mainFrame.Parent = screenGui
-round(mainFrame, 12)
-stroke(mainFrame, THEME.stroke, 1.5)
-
-local mainLayout = Instance.new("UIListLayout")
-mainLayout.Padding = UDim.new(0, 8)
-mainLayout.Parent = mainFrame
-
-local mainPadding = Instance.new("UIPadding")
-mainPadding.PaddingTop = UDim.new(0, 12)
-mainPadding.PaddingBottom = UDim.new(0, 12)
-mainPadding.PaddingLeft = UDim.new(0, 12)
-mainPadding.PaddingRight = UDim.new(0, 12)
-mainPadding.Parent = mainFrame
-
--- Шапка
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 24)
-header.BackgroundTransparency = 1
-header.Parent = mainFrame
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -30, 1, 0)
-title.BackgroundTransparency = 1
-title.TextColor3 = THEME.text
-title.Text = "⚡ Naramato Manager"
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = header
-
-local minimizeBtn = Instance.new("TextButton")
-minimizeBtn.Size = UDim2.new(0, 24, 0, 24)
-minimizeBtn.Position = UDim2.new(1, -24, 0, 0)
-minimizeBtn.BackgroundColor3 = THEME.card
-minimizeBtn.TextColor3 = THEME.subtext
-minimizeBtn.Text = "—"
-minimizeBtn.Font = Enum.Font.GothamBold
-minimizeBtn.TextSize = 13
-minimizeBtn.Parent = header
-round(minimizeBtn, 6)
-stroke(minimizeBtn, THEME.stroke, 1)
-
--- Статус
-local statusCard = Instance.new("Frame")
-statusCard.Size = UDim2.new(1, 0, 0, 32)
-statusCard.BackgroundColor3 = THEME.card
-statusCard.Parent = mainFrame
-round(statusCard, 8)
-stroke(statusCard, THEME.stroke, 1)
-
-local statusText = Instance.new("TextLabel")
-statusText.Size = UDim2.new(1, -16, 1, 0)
-statusText.Position = UDim2.new(0, 8, 0, 0)
-statusText.BackgroundTransparency = 1
-statusText.TextColor3 = THEME.statusIdle
-statusText.Text = "Готов к работе"
-statusText.Font = Enum.Font.GothamMedium
-statusText.TextSize = 12
-statusText.TextXAlignment = Enum.TextXAlignment.Left
-statusText.Parent = statusCard
-
-local function setStatus(text, color)
-	statusText.Text = text
-	statusText.TextColor3 = color or THEME.text
-end
-
--- Кнопки "Все трубы" / "Стоп"
-local mainActions = Instance.new("Frame")
-mainActions.Size = UDim2.new(1, 0, 0, 32)
-mainActions.BackgroundTransparency = 1
-mainActions.Parent = mainFrame
-
-local btnStart = Instance.new("TextButton")
-btnStart.Size = UDim2.new(0.68, -4, 1, 0)
-btnStart.BackgroundColor3 = THEME.btnStart
-btnStart.TextColor3 = Color3.new(1, 1, 1)
-btnStart.Text = "▶ Все трубы"
-btnStart.Font = Enum.Font.GothamBold
-btnStart.TextSize = 13
-btnStart.Parent = mainActions
-round(btnStart, 8)
-
-local btnStop = Instance.new("TextButton")
-btnStop.Size = UDim2.new(0.32, 0, 1, 0)
-btnStop.Position = UDim2.new(0.68, 4, 0, 0)
-btnStop.BackgroundColor3 = THEME.btnStop
-btnStop.TextColor3 = Color3.new(1, 1, 1)
-btnStop.Text = "⏹ Стоп"
-btnStop.Font = Enum.Font.GothamBold
-btnStop.TextSize = 13
-btnStop.Parent = mainActions
-round(btnStop, 8)
-
--- Быстрые ТП: Генератор и Коммуникации
-local quickGrid = Instance.new("Frame")
-quickGrid.Size = UDim2.new(1, 0, 0, 32)
-quickGrid.BackgroundTransparency = 1
-quickGrid.Parent = mainFrame
-
-local btnGen = Instance.new("TextButton")
-btnGen.Size = UDim2.new(0.5, -4, 1, 0)
-btnGen.BackgroundColor3 = THEME.btnSpecial
-btnGen.TextColor3 = Color3.new(1, 1, 1)
-btnGen.Text = "⚡ Генератор"
-btnGen.Font = Enum.Font.GothamBold
-btnGen.TextSize = 12
-btnGen.Parent = quickGrid
-round(btnGen, 8)
-
-local btnComm = Instance.new("TextButton")
-btnComm.Size = UDim2.new(0.5, -4, 1, 0)
-btnComm.Position = UDim2.new(0.5, 4, 0, 0)
-btnComm.BackgroundColor3 = THEME.btnSpecial
-btnComm.TextColor3 = Color3.new(1, 1, 1)
-btnComm.Text = "📡 Коммуникация"
-btnComm.Font = Enum.Font.GothamBold
-btnComm.TextSize = 12
-btnComm.Parent = quickGrid
-round(btnComm, 8)
-
--- Список труб
-local btnSelect = Instance.new("TextButton")
-btnSelect.Size = UDim2.new(1, 0, 0, 32)
-btnSelect.BackgroundColor3 = THEME.btnAction
-btnSelect.TextColor3 = Color3.new(1, 1, 1)
-btnSelect.Text = "📋 Выбрать трубу (меню) ▼"
-btnSelect.Font = Enum.Font.GothamMedium
-btnSelect.TextSize = 12
-btnSelect.Parent = mainFrame
-round(btnSelect, 8)
-
-local pipesListFrame = Instance.new("ScrollingFrame")
-pipesListFrame.Size = UDim2.new(1, 0, 0, 150)
-pipesListFrame.BackgroundColor3 = THEME.card
-pipesListFrame.CanvasSize = UDim2.new(0, 0, 0, #PIPE_POSITIONS * 30 + 10)
-pipesListFrame.ScrollBarThickness = 4
-pipesListFrame.Visible = false
-pipesListFrame.Parent = mainFrame
-round(pipesListFrame, 8)
-stroke(pipesListFrame, THEME.stroke, 1)
-
-local pipeListLayout = Instance.new("UIListLayout")
-pipeListLayout.Padding = UDim.new(0, 4)
-pipeListLayout.Parent = pipesListFrame
-
-local pipeListPad = Instance.new("UIPadding")
-pipeListPad.PaddingTop = UDim.new(0, 6)
-pipeListPad.PaddingLeft = UDim.new(0, 6)
-pipeListPad.PaddingRight = UDim.new(0, 6)
-pipeListPad.Parent = pipesListFrame
-
-for _, pipe in ipairs(PIPE_POSITIONS) do
-	local pBtn = Instance.new("TextButton")
-	pBtn.Size = UDim2.new(1, -6, 0, 26)
-	pBtn.BackgroundColor3 = THEME.bg
-	pBtn.TextColor3 = THEME.text
-	pBtn.Text = string.format("Труба %d (держать до урона)", pipe.id)
-	pBtn.Font = Enum.Font.Gotham
-	pBtn.TextSize = 12
-	pBtn.Parent = pipesListFrame
-	round(pBtn, 6)
-
-	pBtn.MouseButton1Click:Connect(function()
-		if isRunning then return end
-		isRunning = true
-		task.spawn(function()
-			teleportUntilVerifiedDamage(pipe, setStatus)
-			if isRunning then
-				setStatus(string.format("%s пройдена!", pipe.name), THEME.statusOk)
-				isRunning = false
-			end
-		end)
-	end)
-end
-
---------------------------------------------------------------------
--- СОБЫТИЯ КНОПОК
---------------------------------------------------------------------
-btnSelect.MouseButton1Click:Connect(function()
-	pipesListFrame.Visible = not pipesListFrame.Visible
-	btnSelect.Text = pipesListFrame.Visible and "📋 Скрыть список ▲" or "📋 Выбрать трубу (меню) ▼"
-end)
-
-btnGen.MouseButton1Click:Connect(function()
-	isRunning = false
-	setNoClip(false)
-	setStatus("ТП к Генератору...", THEME.btnSpecial)
-	quickTeleport(GENERATOR_POS)
-	setStatus("У Генератора", THEME.statusOk)
-end)
-
-btnComm.MouseButton1Click:Connect(function()
-	isRunning = false
-	setNoClip(false)
-	setStatus("ТП к Коммуникациям...", THEME.btnSpecial)
-	quickTeleport(COMMUNIC_POS)
-	setStatus("У Коммуникаций", THEME.statusOk)
-end)
-
-btnStop.MouseButton1Click:Connect(function()
-	isRunning = false
-	setNoClip(false)
-	setStatus("Остановлено", THEME.statusIdle)
-end)
-
-btnStart.MouseButton1Click:Connect(function()
-	if isRunning then return end
-	isRunning = true
-
-	task.spawn(function()
-		for _, pipe in ipairs(PIPE_POSITIONS) do
-			if not isRunning then break end
-			teleportUntilVerifiedDamage(pipe, setStatus)
-		end
-
-		if isRunning then
-			setStatus("Все трубы успешно пройдены!", THEME.statusOk)
-			isRunning = false
-		end
-	end)
-end)
-
-local function toggleUI(visible)
-	mainFrame.Visible = visible
-	openBtn.Visible = not visible
-end
-
-minimizeBtn.MouseButton1Click:Connect(function() toggleUI(false) end)
-openBtn.MouseButton1Click:Connect(function() toggleUI(true) end)
-
-UserInputService.InputBegan:Connect(function(input, processed)
-	if not processed and input.KeyCode == CONFIG.TOGGLE_KEY then
-		toggleUI(not mainFrame.Visible)
-	end
-end)
+			if sensorArmed and isAtPipe
