@@ -1,4 +1,4 @@
--- Standalone LocalScript: Naramato Manager v2 (Instant TP + Anti-Rollback Lock + Full UI)
+-- Standalone LocalScript: Naramato Manager v2 (Infinite TP Lock Until Damage)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -7,17 +7,16 @@ local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 --------------------------------------------------------------------
--- ТОЧКИ И НАСТРОЙКИ
+-- НАСТРОЙКИ И КООРДИНАТЫ
 --------------------------------------------------------------------
 local CONFIG = {
-	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте (чтобы стоять в хитбоксе)
-	STREAM_TIMEOUT = 5,            -- ожидание загрузки чанков
-	HIT_INTERVAL = 0.35,           -- интервал ударов инструментом
-	DAMAGE_EPSILON = 0.01,         -- минимальный урон для триггера перехода
-	DAMAGE_TIMEOUT = 3.0,          -- макс. время ожидания урона на трубе
-	MAX_PIPE_RETRIES = 3,          -- попыток вернуть к трубе при откате
-	BETWEEN_PIPES_PAUSE = 0.25,    -- пауза перед ТП к следующей трубе
-	TOOL_NAME = nil,               -- nil = первый инструмент в Backpack/Character
+	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте у трубы
+	TP_LOOP_INTERVAL = 0.05,       -- частота повторного ТП к трубе (сек)
+	HIT_INTERVAL = 0.35,           -- интервал ударов инструментом (сек)
+	DAMAGE_EPSILON = 0.01,         -- минимальный урон для срабатывания датчика
+	BETWEEN_PIPES_PAUSE = 0.25,    -- пауза после урона перед следующей трубой
+	STREAM_TIMEOUT = 3,            -- подгрузка чанков
+	TOOL_NAME = nil,               -- nil = брать любой инструмент
 	TOGGLE_KEY = Enum.KeyCode.RightControl,
 }
 
@@ -56,7 +55,7 @@ local isRunning = false
 local noclipConn = nil
 
 --------------------------------------------------------------------
--- МЕХАНИКА ТЕЛЕПОРТА И АНТИ-ОТКАТА
+-- ФИЗИКА И ТЕЛЕПОРТ
 --------------------------------------------------------------------
 local function setNoClip(state)
 	if noclipConn then
@@ -79,8 +78,8 @@ end
 
 local function getCharParts()
 	local char = player.Character or player.CharacterAdded:Wait()
-	local hrp = char:WaitForChild("HumanoidRootPart", 5)
-	local hum = char:WaitForChild("Humanoid", 5)
+	local hrp = char:WaitForChild("HumanoidRootPart", 10)
+	local hum = char:WaitForChild("Humanoid", 10)
 	return char, hrp, hum
 end
 
@@ -101,95 +100,91 @@ local function equipTool()
 	return nil
 end
 
--- Мгновенный ТП с удержанием CFrame против сетевого отката
-local function instantTeleport(targetPos)
-	local char, hrp, hum = getCharParts()
-	if not hrp or not hum or hum.Health <= 0 then return false end
+-- Одиночный быстрый ТП (для Генератора, Коммуникации и ручного выбора)
+local function quickTeleport(targetPos)
+	local _, hrp, hum = getCharParts()
+	if not hrp or not hum or hum.Health <= 0 then return end
 
 	pcall(function()
 		player:RequestStreamAroundAsync(targetPos, CONFIG.STREAM_TIMEOUT)
 	end)
 
-	local destCFrame = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
-
-	setNoClip(true)
-	-- Фиксируем позицию на 6 кадров, чтобы сервер перезаписал старую координату
-	for _ = 1, 6 do
-		hrp.CFrame = destCFrame
+	local dest = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
+	for _ = 1, 5 do
+		hrp.CFrame = dest
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
 		task.wait(0.03)
 	end
-	setNoClip(false)
-
-	return (hrp.Position - destCFrame.Position).Magnitude < 8
 end
 
 --------------------------------------------------------------------
--- ЦИКЛ ТРУБЫ С КОНТРОЛЕМ УРОНА
+-- БЕСКОНЕЧНЫЙ ТП К ТРУБЕ ДО ПОЛУЧЕНИЯ УРОНА
 --------------------------------------------------------------------
-local function processPipe(pipe, updateStatus)
-	local char, hrp, hum = getCharParts()
-	if not hum or hum.Health <= 0 then return false end
+local function teleportUntilDamage(pipe, updateStatus)
+	pcall(function()
+		player:RequestStreamAroundAsync(pipe.pos, CONFIG.STREAM_TIMEOUT)
+	end)
 
-	local retries = 0
-	local target = pipe.pos
+	local destCFrame = CFrame.new(pipe.pos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
 
-	while retries < CONFIG.MAX_PIPE_RETRIES and isRunning do
-		updateStatus(string.format("ТП к %s...", pipe.name), THEME.btnAction)
-		instantTeleport(target)
-
-		char, hrp, hum = getCharParts()
-		if not hrp or not hum or hum.Health <= 0 then return false end
-
-		-- Проверка: удержались ли на точке после ТП
-		if (hrp.Position - target).Magnitude > 8 then
-			updateStatus("Откат сервера! Повтор ТП...", THEME.statusWarn)
-			retries = retries + 1
+	while isRunning do
+		local _, hrp, hum = getCharParts()
+		if not hrp or not hum then
 			task.wait(0.2)
-		else
-			updateStatus(string.format("%s: ожидание урона...", pipe.name), THEME.statusOk)
-			local initialHealth = hum.Health
-			local start = tick()
-			local tookDamage = false
-			local lastHit = 0
+			continue
+		end
 
-			while isRunning and (tick() - start) < CONFIG.DAMAGE_TIMEOUT do
-				-- Если во время ожидания сервер резко откинул назад — возвращаем на место
-				if (hrp.Position - target).Magnitude > 8 then
-					updateStatus("Откат в процессе! Возврат...", THEME.statusWarn)
-					instantTeleport(target)
-				end
+		-- Если персонаж мертв, ждем возрождения и повторяем эту же трубу
+		if hum.Health <= 0 then
+			updateStatus("Персонаж погиб, ждем респавн...", THEME.statusWarn)
+			player.CharacterAdded:Wait()
+			task.wait(1)
+			continue
+		end
 
-				-- Удар инструментом
-				if tick() - lastHit >= CONFIG.HIT_INTERVAL then
-					lastHit = tick()
-					local tool = equipTool()
-					if tool then tool:Activate() end
-				end
+		local tookDamage = false
+		local lastHealth = hum.Health
 
-				-- Проверка урона
-				if (initialHealth - hum.Health) >= CONFIG.DAMAGE_EPSILON then
-					tookDamage = true
-					break
-				end
-
-				task.wait(0.04)
-			end
-
-			if tookDamage then
-				updateStatus(string.format("Урон получен: %s", pipe.name), THEME.statusOk)
-				task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
-				return true
+		-- Подписка на изменение здоровья (с учетом возможной регенерации)
+		local healthConn
+		healthConn = hum.HealthChanged:Connect(function(newHealth)
+			if newHealth > 0 and (lastHealth - newHealth) >= CONFIG.DAMAGE_EPSILON then
+				tookDamage = true
 			else
-				retries = retries + 1
-				updateStatus("Нет урона, микро-доводка к трубе...", THEME.statusWarn)
-				-- Смещаемся на 0.4 студа ближе к центру трубы
-				target = pipe.pos + (pipe.pos - hrp.Position).Unit * 0.4
-				task.wait(0.1)
+				lastHealth = newHealth
 			end
+		end)
+
+		setNoClip(true)
+		updateStatus(string.format("Удерживаем %s (ждем урон)...", pipe.name), THEME.btnAction)
+
+		local lastHit = 0
+		-- Телепортируем в точку каждые TP_LOOP_INTERVAL секунд, пока не пройдет урон
+		while isRunning and not tookDamage and hum.Health > 0 do
+			hrp.CFrame = destCFrame
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+
+			if tick() - lastHit >= CONFIG.HIT_INTERVAL then
+				lastHit = tick()
+				local tool = equipTool()
+				if tool then tool:Activate() end
+			end
+
+			task.wait(CONFIG.TP_LOOP_INTERVAL)
+		end
+
+		if healthConn then healthConn:Disconnect() end
+		setNoClip(false)
+
+		if tookDamage then
+			updateStatus(string.format("Урон получен на %s! Переход...", pipe.name), THEME.statusOk)
+			task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
+			return true
 		end
 	end
+
 	return false
 end
 
@@ -218,7 +213,6 @@ local function stroke(obj, color, thickness)
 	s.Parent = obj
 end
 
--- Плавающая кнопка развертывания
 local openBtn = Instance.new("TextButton")
 openBtn.Size = UDim2.new(0, 85, 0, 32)
 openBtn.Position = UDim2.new(0, 20, 0.45, 0)
@@ -232,7 +226,6 @@ openBtn.Parent = screenGui
 round(openBtn, 16)
 stroke(openBtn, THEME.stroke, 1.5)
 
--- Главный фрейм
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(0, 290, 0, 0)
 mainFrame.AutomaticSize = Enum.AutomaticSize.Y
@@ -281,7 +274,7 @@ minimizeBtn.Parent = header
 round(minimizeBtn, 6)
 stroke(minimizeBtn, THEME.stroke, 1)
 
--- Карточка статуса
+-- Статус
 local statusCard = Instance.new("Frame")
 statusCard.Size = UDim2.new(1, 0, 0, 32)
 statusCard.BackgroundColor3 = THEME.card
@@ -359,7 +352,7 @@ btnComm.TextSize = 12
 btnComm.Parent = quickGrid
 round(btnComm, 8)
 
--- Кнопка и меню выбора отдельной трубы
+-- Список труб
 local btnSelect = Instance.new("TextButton")
 btnSelect.Size = UDim2.new(1, 0, 0, 32)
 btnSelect.BackgroundColor3 = THEME.btnAction
@@ -390,27 +383,33 @@ pipeListPad.PaddingLeft = UDim.new(0, 6)
 pipeListPad.PaddingRight = UDim.new(0, 6)
 pipeListPad.Parent = pipesListFrame
 
--- Генерация кнопок для каждой трубы
+-- При нажатии на отдельную трубу тоже удерживает на ней до получения урона
 for _, pipe in ipairs(PIPE_POSITIONS) do
 	local pBtn = Instance.new("TextButton")
 	pBtn.Size = UDim2.new(1, -6, 0, 26)
 	pBtn.BackgroundColor3 = THEME.bg
 	pBtn.TextColor3 = THEME.text
-	pBtn.Text = string.format("Труба %d", pipe.id)
+	pBtn.Text = string.format("Труба %d (ТП до урона)", pipe.id)
 	pBtn.Font = Enum.Font.Gotham
 	pBtn.TextSize = 12
 	pBtn.Parent = pipesListFrame
 	round(pBtn, 6)
 
 	pBtn.MouseButton1Click:Connect(function()
-		setStatus(string.format("ТП к %s...", pipe.name), THEME.btnAction)
-		instantTeleport(pipe.pos)
-		setStatus(string.format("На точке %s", pipe.name), THEME.statusOk)
+		if isRunning then return end
+		isRunning = true
+		task.spawn(function()
+			teleportUntilDamage(pipe, setStatus)
+			if isRunning then
+				setStatus(string.format("%s готова!", pipe.name), THEME.statusOk)
+				isRunning = false
+			end
+		end)
 	end)
 end
 
 --------------------------------------------------------------------
--- ОБРАБОТЧИКИ СОБЫТИЙ UI
+-- СОБЫТИЯ КНОПОК
 --------------------------------------------------------------------
 btnSelect.MouseButton1Click:Connect(function()
 	pipesListFrame.Visible = not pipesListFrame.Visible
@@ -418,24 +417,26 @@ btnSelect.MouseButton1Click:Connect(function()
 end)
 
 btnGen.MouseButton1Click:Connect(function()
+	isRunning = false
+	setNoClip(false)
 	setStatus("ТП к Генератору...", THEME.btnSpecial)
-	instantTeleport(GENERATOR_POS)
+	quickTeleport(GENERATOR_POS)
 	setStatus("У Генератора", THEME.statusOk)
 end)
 
 btnComm.MouseButton1Click:Connect(function()
+	isRunning = false
+	setNoClip(false)
 	setStatus("ТП к Коммуникациям...", THEME.btnSpecial)
-	instantTeleport(COMMUNIC_POS)
+	quickTeleport(COMMUNIC_POS)
 	setStatus("У Коммуникаций", THEME.statusOk)
 end)
 
-local function stopAll()
+btnStop.MouseButton1Click:Connect(function()
 	isRunning = false
 	setNoClip(false)
 	setStatus("Остановлено", THEME.statusIdle)
-end
-
-btnStop.MouseButton1Click:Connect(stopAll)
+end)
 
 btnStart.MouseButton1Click:Connect(function()
 	if isRunning then return end
@@ -444,34 +445,23 @@ btnStart.MouseButton1Click:Connect(function()
 	task.spawn(function()
 		for _, pipe in ipairs(PIPE_POSITIONS) do
 			if not isRunning then break end
-
-			local ok = processPipe(pipe, setStatus)
-			if not ok and isRunning then
-				setStatus(string.format("Пропуск %s (нет урона)", pipe.name), THEME.statusWarn)
-				task.wait(0.3)
-			end
+			teleportUntilDamage(pipe, setStatus)
 		end
 
 		if isRunning then
-			setStatus("Все трубы пройдены!", THEME.statusOk)
+			setStatus("Все трубы успешно пройдены!", THEME.statusOk)
 			isRunning = false
 		end
 	end)
 end)
 
--- Сворачивание и горячие клавиши
 local function toggleUI(visible)
 	mainFrame.Visible = visible
 	openBtn.Visible = not visible
 end
 
-minimizeBtn.MouseButton1Click:Connect(function()
-	toggleUI(false)
-end)
-
-openBtn.MouseButton1Click:Connect(function()
-	toggleUI(true)
-end)
+minimizeBtn.MouseButton1Click:Connect(function() toggleUI(false) end)
+openBtn.MouseButton1Click:Connect(function() toggleUI(true) end)
 
 UserInputService.InputBegan:Connect(function(input, processed)
 	if not processed and input.KeyCode == CONFIG.TOGGLE_KEY then
