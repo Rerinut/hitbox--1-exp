@@ -1,4 +1,199 @@
+-- Standalone LocalScript: Naramato Manager v2 (Fixed Anti-Rollback, Respawn & Damage Trigger)
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
 
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+--------------------------------------------------------------------
+-- НАСТРОЙКИ
+--------------------------------------------------------------------
+local CONFIG = {
+	USE_TWEEN = true,              -- true = плавный полет (обход отката), false = мгновенный ТП
+	TWEEN_SPEED = 280,             -- 250-300 студов/сек оптимально для стабильной синхронизации
+	TELEPORT_HEIGHT_OFFSET = 0.5,  -- небольшое смещение по Y, чтобы касаться триггера
+	ARRIVAL_TOLERANCE = 10,        -- допустимая погрешность позиции у трубы (в студах)
+	STREAM_TIMEOUT = 5,            -- ожидание подгрузки чанков, сек
+	HIT_INTERVAL = 0.4,            -- интервал ударов инструмента, сек
+	DAMAGE_EPSILON = 0.01,         -- минимальный урон для фиксации перехода
+	DAMAGE_TIMEOUT = 3.5,          -- макс. время ожидания урона на трубе перед корректировкой
+	MAX_PIPE_RETRIES = 3,          -- попыток вернуть персонажа к трубе при откате
+	BETWEEN_PIPES_PAUSE = 0.3,     -- пауза перед полетом к следующей трубе
+	RESPAWN_WAIT = 15,             -- макс. время ожидания возрождения персонажа, сек
+	TOOL_NAME = nil,               -- nil = первый инструмент из Backpack/Character
+	TOGGLE_KEY = Enum.KeyCode.RightControl,
+}
+
+local PIPE_POSITIONS = {
+	{id = 1,  name = "Труба 1",  pos = Vector3.new(-3806.71, 98.50, 5093.26)},
+	{id = 2,  name = "Труба 2",  pos = Vector3.new(-3960.26, 106.50, 5281.30)},
+	{id = 3,  name = "Труба 3",  pos = Vector3.new(-3671.71, 93.50, 5389.35)},
+	{id = 4,  name = "Труба 4",  pos = Vector3.new(-3616.63, 93.50, 5278.25)},
+	{id = 5,  name = "Труба 5",  pos = Vector3.new(-3419.04, 93.50, 5230.96)},
+	{id = 6,  name = "Труба 6",  pos = Vector3.new(-3470.64, 93.50, 5412.19)},
+	{id = 7,  name = "Труба 7",  pos = Vector3.new(-3425.63, 95.00, 5463.00)},
+	{id = 8,  name = "Труба 8",  pos = Vector3.new(-3527.75, 93.50, 5588.77)},
+	{id = 9,  name = "Труба 9",  pos = Vector3.new(-3464.73, 110.50, 5665.48)},
+	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)},
+}
+
+local THEME = {
+	bg = Color3.fromRGB(20, 22, 28),
+	card = Color3.fromRGB(28, 31, 38),
+	stroke = Color3.fromRGB(45, 50, 62),
+	text = Color3.fromRGB(240, 242, 245),
+	subtext = Color3.fromRGB(150, 155, 170),
+	btnStart = Color3.fromRGB(38, 140, 75),
+	btnStop = Color3.fromRGB(180, 50, 50),
+	btnSelect = Color3.fromRGB(48, 105, 190),
+	statusOk = Color3.fromRGB(80, 215, 120),
+	statusWarn = Color3.fromRGB(255, 195, 70),
+	statusErr = Color3.fromRGB(255, 90, 90),
+	statusIdle = Color3.fromRGB(130, 140, 160),
+}
+
+--------------------------------------------------------------------
+-- СОСТОЯНИЕ
+--------------------------------------------------------------------
+local isRunning = false
+local currentTween = nil
+local flightConnection = nil
+local inputConnection = nil
+local savedCollisions = {}
+
+--------------------------------------------------------------------
+-- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФИЗИКИ И ПЕРЕМЕЩЕНИЯ
+--------------------------------------------------------------------
+local function resetVelocity(hrp)
+	if hrp and hrp.Parent then
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
+end
+
+-- Включает/выключает NoClip и стабилизацию скорости в полете,
+-- а при выключении возвращает исходные настройки CanCollide
+local function setFlightMode(enabled)
+	if flightConnection then
+		flightConnection:Disconnect()
+		flightConnection = nil
+	end
+
+	if enabled then
+		flightConnection = RunService.Stepped:Connect(function()
+			local char = player.Character
+			if not char then return end
+
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				resetVelocity(hrp)
+			end
+
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") then
+					if savedCollisions[part] == nil then
+						savedCollisions[part] = part.CanCollide
+					end
+					if part.CanCollide then
+						part.CanCollide = false
+					end
+				end
+			end
+		end)
+	else
+		for part, canCollide in pairs(savedCollisions) do
+			if part and part.Parent then
+				part.CanCollide = canCollide
+			end
+		end
+		table.clear(savedCollisions)
+	end
+end
+
+-- Возвращает живого персонажа, ожидая возрождения при необходимости
+local function getAliveCharacterParts(updateStatus)
+	local deadline = os.clock() + CONFIG.RESPAWN_WAIT
+
+	while isRunning and os.clock() < deadline do
+		local char = player.Character
+		if char then
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hrp and hum and hum.Health > 0 and hum:GetState() ~= Enum.HumanoidStateType.Dead then
+				return char, hrp, hum
+			end
+		end
+
+		if updateStatus then
+			updateStatus("Ожидание возрождения персонажа...", THEME.statusWarn)
+		end
+		task.wait(0.25)
+	end
+
+	local char = player.Character
+	if char then
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hrp and hum and hum.Health > 0 then
+			return char, hrp, hum
+		end
+	end
+
+	return nil, nil, nil
+end
+
+local function equipTool(char, hum)
+	if not char or not hum or hum.Health <= 0 then return nil end
+
+	local equipped = char:FindFirstChildOfClass("Tool")
+	if equipped and (not CONFIG.TOOL_NAME or equipped.Name == CONFIG.TOOL_NAME) then
+		return equipped
+	end
+
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	if not backpack then return nil end
+
+	local tool = nil
+	if CONFIG.TOOL_NAME then
+		tool = backpack:FindFirstChild(CONFIG.TOOL_NAME)
+	else
+		tool = backpack:FindFirstChildOfClass("Tool")
+	end
+
+	if tool then
+		hum:EquipTool(tool)
+		return tool
+	end
+
+	return nil
+end
+
+-- Перемещение с предзагрузкой чанков и защитой от гравитационного рывка
+local function moveTo(targetPos, updateStatus)
+	local _, hrp, hum = getAliveCharacterParts(updateStatus)
+	if not hrp or not hum then return false end
+
+	pcall(function()
+		player:RequestStreamAroundAsync(targetPos, CONFIG.STREAM_TIMEOUT)
+	end)
+
+	local destPos = targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
+	local destCFrame = CFrame.new(destPos)
+
+	if CONFIG.USE_TWEEN then
+		setFlightMode(true)
+		resetVelocity(hrp)
+
+		local distance = (hrp.Position - destPos).Magnitude
+		local duration = math.clamp(distance / math.max(CONFIG.TWEEN_SPEED, 1), 0.05, 20)
+
+		local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+		local tween = TweenService:Create(hrp, tweenInfo, {CFrame = destCFrame})
+		currentTween = tween
+
+		local finished = false
 		local conn = tween.Completed:Connect(function()
 			finished = true
 		end)
