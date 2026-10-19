@@ -1,3 +1,11 @@
+Вот обновленный скрипт. В секцию **`CONFIG`** добавлены два новых параметра:
+
+* `GENERATOR_WAIT_TIME = 5.0` — время удержания/прыжков у Генератора (в секундах).
+* `COMMUNIC_WAIT_TIME = 5.0` — время удержания/прыжков у Коммуникаций (в секундах).
+
+Вы можете легко изменить эти значения (например, поставить `10.0` вместо `5.0`), если вам потребуется еще больше времени.
+
+```lua
 -- Standalone LocalScript: Naramato Manager v2 (Strict Verified Pipe Damage Lock) - исправленная версия
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -11,16 +19,20 @@ local playerGui = player:WaitForChild("PlayerGui")
 --------------------------------------------------------------------
 local CONFIG = {
 	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте у трубы
-	TP_LOOP_INTERVAL = 0.04,       -- частота удержания позиции (сек)
-	STABILIZE_TIME = 0.8,          -- сколько сек нужно простоять у новой трубы без отката до включения датчика
-	MAX_VALID_DIST = 4.5,          -- макс. радиус от трубы, внутри которого урон считается валидным
-	JIGGLE_RADIUS = 0.25,          -- микро-смещение для срабатывания серверного .Touched трубы
-	HIT_INTERVAL = 0.35,           -- интервал ударов инструментом (сек)
-	DAMAGE_EPSILON = 0.1,          -- минимальный урон для срабатывания датчика
-	BETWEEN_PIPES_PAUSE = 0.4,     -- пауза после урона перед следующей трубой
-	STREAM_TIMEOUT = 3,            -- подгрузка чанков
-	TOOL_NAME = nil,               -- nil = брать любой инструмент
+	TP_LOOP_INTERVAL = 0.04,        -- частота удержания позиции (сек)
+	STABILIZE_TIME = 0.8,           -- сколько сек нужно простоять у новой трубы без отката до включения датчика
+	MAX_VALID_DIST = 4.5,           -- макс. радиус от трубы, внутри которого урон считается валидным
+	JIGGLE_RADIUS = 0.25,           -- микро-смещение для срабатывания серверного .Touched трубы
+	HIT_INTERVAL = 0.35,            -- интервал ударов инструментом (сек)
+	DAMAGE_EPSILON = 0.1,           -- минимальный урон для срабатывания датчика
+	BETWEEN_PIPES_PAUSE = 0.4,      -- пауза после урона перед следующей трубой
+	STREAM_TIMEOUT = 3,             -- подгрузка чанков
+	TOOL_NAME = nil,                -- nil = брать любой инструмент
 	TOGGLE_KEY = Enum.KeyCode.RightControl,
+	
+	-- Настройки времени удержания (прыжков) для генератора и коммуникаций (в секундах)
+	GENERATOR_WAIT_TIME = 5.0,      
+	COMMUNIC_WAIT_TIME = 5.0,       
 }
 
 local PIPE_POSITIONS = {
@@ -55,9 +67,9 @@ local THEME = {
 }
 
 local isRunning = false
-local isBusy = false          -- рабочий поток еще не завершился
+local isBusy = false         -- рабочий поток еще не завершился
 local noclipConn = nil
-local noclipChanged = {}      -- части, у которых мы отключили CanCollide
+local noclipChanged = {}     -- части, у которых мы отключили CanCollide
 
 --------------------------------------------------------------------
 -- ФИЗИКА И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -137,7 +149,7 @@ local function equipTool()
 	return nil
 end
 
-local function quickTeleport(targetPos)
+local function quickTeleport(targetPos, waitTime, statusName)
 	local _, hrp, hum = getCharParts()
 	if not hrp or not hum or hum.Health <= 0 then return end
 
@@ -146,12 +158,29 @@ local function quickTeleport(targetPos)
 	end)
 
 	local dest = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
-	for _ = 1, 6 do
+	
+	-- Удерживаем позицию и выполняем микро-движения заданное время (waitTime)
+	local startTime = tick()
+	local stepAngle = 0
+	
+	while tick() - startTime < waitTime do
 		if not hrp.Parent then return end
-		hrp.CFrame = dest
+		
+		stepAngle = stepAngle + 1.2
+		local jiggleOffset = Vector3.new(
+			math.cos(stepAngle) * CONFIG.JIGGLE_RADIUS,
+			0,
+			math.sin(stepAngle) * CONFIG.JIGGLE_RADIUS
+		)
+		
+		hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0) + jiggleOffset)
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
-		task.wait(0.03)
+		
+		local timeLeft = waitTime - (tick() - startTime)
+		setStatus(string.format("У %s (уд. %.1fс)...", statusName, timeLeft), THEME.btnSpecial)
+		
+		task.wait(CONFIG.TP_LOOP_INTERVAL)
 	end
 end
 
@@ -529,7 +558,7 @@ btnGen.MouseButton1Click:Connect(function()
 	isRunning = false
 	setNoClip(false)
 	setStatus("ТП к Генератору...", THEME.btnSpecial)
-	quickTeleport(GENERATOR_POS)
+	quickTeleport(GENERATOR_POS, CONFIG.GENERATOR_WAIT_TIME, "Генератора")
 	setStatus("У Генератора", THEME.statusOk)
 end)
 
@@ -537,7 +566,7 @@ btnComm.MouseButton1Click:Connect(function()
 	isRunning = false
 	setNoClip(false)
 	setStatus("ТП к Коммуникациям...", THEME.btnSpecial)
-	quickTeleport(COMMUNIC_POS)
+	quickTeleport(COMMUNIC_POS, CONFIG.COMMUNIC_WAIT_TIME, "Коммуникаций")
 	setStatus("У Коммуникаций", THEME.statusOk)
 end)
 
@@ -574,3 +603,5 @@ UserInputService.InputBegan:Connect(function(input, processed)
 		toggleUI(not mainFrame.Visible)
 	end
 end)
+
+```
