@@ -1,4 +1,4 @@
--- Standalone LocalScript: Naramato Manager v2 (Fixed Anti-Rollback & Damage Trigger)
+-- Standalone LocalScript: Naramato Manager v2 (исправленная версия)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -11,13 +11,13 @@ local playerGui = player:WaitForChild("PlayerGui")
 -- НАСТРОЙКИ
 --------------------------------------------------------------------
 local CONFIG = {
-	USE_TWEEN = true,              -- true = плавный полет (обход отката), false = мгновенный ТП
-	TWEEN_SPEED = 280,             -- 250-300 студов/сек оптимально для стабильной синхронизации
+	USE_TWEEN = true,              -- true = плавный полет, false = мгновенный ТП
+	TWEEN_SPEED = 280,             -- студов/сек
 	TELEPORT_HEIGHT_OFFSET = 0.5,  -- небольшое смещение, чтобы касаться триггера
 	STREAM_TIMEOUT = 5,            -- ожидание подгрузки чанков, сек
 	HIT_INTERVAL = 0.4,            -- интервал ударов инструмента
 	DAMAGE_EPSILON = 0.01,         -- минимальный урон для фиксации перехода
-	DAMAGE_TIMEOUT = 3.5,          -- макс. время ожидания урона на трубе перед корректировкой
+	DAMAGE_TIMEOUT = 3.5,          -- макс. время ожидания урона на трубе
 	MAX_PIPE_RETRIES = 3,          -- попыток вернуть персонажа к трубе при откате
 	BETWEEN_PIPES_PAUSE = 0.3,     -- пауза перед полетом к следующей трубе
 	RESPAWN_WAIT = 15,             -- ожидание возрождения персонажа
@@ -57,8 +57,10 @@ local THEME = {
 -- СОСТОЯНИЕ
 --------------------------------------------------------------------
 local isRunning = false
+local isBusy = false          -- рабочий поток еще не завершился
 local currentTween = nil
 local noclipConnection = nil
+local noclipChanged = {}      -- части, у которых мы отключили CanCollide
 
 --------------------------------------------------------------------
 -- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФИЗИКИ И ПЕРЕМЕЩЕНИЯ
@@ -68,25 +70,45 @@ local function setNoClip(enabled)
 		noclipConnection:Disconnect()
 		noclipConnection = nil
 	end
+
 	if enabled then
 		noclipConnection = RunService.Stepped:Connect(function()
 			local char = player.Character
 			if char then
 				for _, part in ipairs(char:GetDescendants()) do
 					if part:IsA("BasePart") and part.CanCollide then
+						noclipChanged[part] = true
 						part.CanCollide = false
 					end
 				end
 			end
 		end)
+	else
+		-- Возвращаем коллизии, которые отключили сами
+		for part in pairs(noclipChanged) do
+			if part.Parent then
+				part.CanCollide = true
+			end
+		end
+		table.clear(noclipChanged)
 	end
 end
 
+-- Возвращает живого персонажа или nil, если он не появился за RESPAWN_WAIT
 local function getCharacterParts()
-	local char = player.Character or player.CharacterAdded:Wait()
-	local hrp = char:WaitForChild("HumanoidRootPart", 5)
-	local hum = char:WaitForChild("Humanoid", 5)
-	return char, hrp, hum
+	local deadline = tick() + CONFIG.RESPAWN_WAIT
+	while isRunning and tick() < deadline do
+		local char = player.Character
+		if char then
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			if hrp and hum and hum.Health > 0 then
+				return char, hrp, hum
+			end
+		end
+		task.wait(0.25)
+	end
+	return nil
 end
 
 local function resetVelocity(hrp)
@@ -99,7 +121,7 @@ end
 local function equipTool()
 	local char = player.Character
 	if not char then return nil end
-	
+
 	local tool = char:FindFirstChildOfClass("Tool")
 	if tool then return tool end
 
@@ -122,7 +144,7 @@ end
 -- Перемещение с предзагрузкой и гашением инерции
 local function moveTo(targetPos)
 	local char, hrp, hum = getCharacterParts()
-	if not hrp or not hum or hum.Health <= 0 then return false end
+	if not hrp then return false end
 
 	pcall(function()
 		player:RequestStreamAroundAsync(targetPos, CONFIG.STREAM_TIMEOUT)
@@ -138,17 +160,24 @@ local function moveTo(targetPos)
 		local duration = math.clamp(distance / CONFIG.TWEEN_SPEED, 0.1, 15)
 
 		local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
-		currentTween = TweenService:Create(hrp, tweenInfo, {CFrame = destCFrame})
+		local tween = TweenService:Create(hrp, tweenInfo, {CFrame = destCFrame})
+		currentTween = tween
 
 		local finished = false
-		local conn = currentTween.Completed:Connect(function() finished = true end)
-		currentTween:Play()
+		local conn = tween.Completed:Connect(function() finished = true end)
+		tween:Play()
 
 		while not finished and isRunning and hum.Health > 0 do
 			task.wait(0.05)
 		end
 		conn:Disconnect()
-		currentTween = nil
+
+		if not finished then
+			tween:Cancel() -- остановка или смерть персонажа
+		end
+		if currentTween == tween then
+			currentTween = nil
+		end
 
 		resetVelocity(hrp)
 		task.wait(0.15)
@@ -159,6 +188,7 @@ local function moveTo(targetPos)
 		task.wait(0.1)
 	end
 
+	if not hrp.Parent then return false end
 	return (hrp.Position - destCFrame.Position).Magnitude < 10
 end
 
@@ -167,17 +197,23 @@ end
 --------------------------------------------------------------------
 local function processPipe(pipe, updateStatus)
 	local retries = 0
-	local char, hrp, hum = getCharacterParts()
-	if not hum or hum.Health <= 0 then return false end
 
 	while retries < CONFIG.MAX_PIPE_RETRIES and isRunning do
+		local char, hrp, hum = getCharacterParts()
+		if not hrp then
+			if isRunning then
+				updateStatus("Персонаж не возродился", THEME.statusErr)
+			end
+			return false
+		end
+
 		updateStatus(string.format("Полет к %s (попытка %d)", pipe.name, retries + 1), THEME.btnSelect)
 		local reached = moveTo(pipe.pos)
 
 		char, hrp, hum = getCharacterParts()
-		if not hrp or not hum or hum.Health <= 0 then return false end
+		if not hrp then return false end
 
-		-- Проверка на мгновенный откат сервером
+		-- Проверка на откат сервером
 		local dist = (hrp.Position - pipe.pos).Magnitude
 		if not reached or dist > 10 then
 			updateStatus("Обнаружен откат! Повторная синхронизация...", THEME.statusWarn)
@@ -186,20 +222,25 @@ local function processPipe(pipe, updateStatus)
 		else
 			-- Мы на месте, ждем урон и активируем инструмент
 			updateStatus(string.format("На точке %s: ожидание урона...", pipe.name), THEME.statusOk)
-			
+
 			local initialHealth = hum.Health
 			local startTime = tick()
 			local tookDamage = false
 			local lastHit = 0
 
 			while isRunning and (tick() - startTime) < CONFIG.DAMAGE_TIMEOUT do
+				-- Персонаж умер или исчез
+				if not hrp.Parent or hum.Health <= 0 then
+					break
+				end
+
 				-- Проверка, не отбросил ли сервер персонажа во время ожидания
 				if (hrp.Position - pipe.pos).Magnitude > 10 then
 					updateStatus("Откат во время взаимодействия!", THEME.statusWarn)
 					break
 				end
 
-				-- Автоудар инструментом при необходимости
+				-- Автоудар инструментом
 				if tick() - lastHit >= CONFIG.HIT_INTERVAL then
 					lastHit = tick()
 					local tool = equipTool()
@@ -219,12 +260,16 @@ local function processPipe(pipe, updateStatus)
 				updateStatus(string.format("Урон получен на %s!", pipe.name), THEME.statusOk)
 				task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
 				return true
-			else
-				-- Если урон не пришел: смещаемся на полстуда ближе к трубе (микродоводка)
+			elseif isRunning then
+				-- Урон не пришел: микродоводка к трубе
 				updateStatus("Урон не зафиксирован, корректировка позиции...", THEME.statusWarn)
 				retries = retries + 1
-				local nudge = (pipe.pos - hrp.Position).Unit * 0.5
-				hrp.CFrame = hrp.CFrame + nudge
+				if hrp.Parent then
+					local offset = pipe.pos - hrp.Position
+					if offset.Magnitude > 0.01 then
+						hrp.CFrame = hrp.CFrame + offset.Unit * 0.5
+					end
+				end
 				task.wait(0.3)
 			end
 		end
@@ -263,12 +308,14 @@ mainFrame.Size = UDim2.new(0, 280, 0, 0)
 mainFrame.AutomaticSize = Enum.AutomaticSize.Y
 mainFrame.Position = UDim2.new(0, 25, 0.25, 0)
 mainFrame.BackgroundColor3 = THEME.bg
+mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
 round(mainFrame, 12)
 stroke(mainFrame, THEME.stroke, 1.5)
 
 local mainLayout = Instance.new("UIListLayout")
 mainLayout.Padding = UDim.new(0, 10)
+mainLayout.SortOrder = Enum.SortOrder.LayoutOrder -- иначе элементы сортируются по имени класса
 mainLayout.Parent = mainFrame
 
 local mainPadding = Instance.new("UIPadding")
@@ -279,6 +326,7 @@ mainPadding.PaddingRight = UDim.new(0, 12)
 mainPadding.Parent = mainFrame
 
 local title = Instance.new("TextLabel")
+title.LayoutOrder = 1
 title.Size = UDim2.new(1, 0, 0, 20)
 title.BackgroundTransparency = 1
 title.TextColor3 = THEME.text
@@ -289,8 +337,10 @@ title.TextXAlignment = Enum.TextXAlignment.Left
 title.Parent = mainFrame
 
 local statusCard = Instance.new("Frame")
+statusCard.LayoutOrder = 2
 statusCard.Size = UDim2.new(1, 0, 0, 36)
 statusCard.BackgroundColor3 = THEME.card
+statusCard.BorderSizePixel = 0
 statusCard.Parent = mainFrame
 round(statusCard, 8)
 
@@ -312,8 +362,10 @@ local function setStatus(text, color)
 end
 
 local btnStart = Instance.new("TextButton")
+btnStart.LayoutOrder = 3
 btnStart.Size = UDim2.new(1, 0, 0, 34)
 btnStart.BackgroundColor3 = THEME.btnStart
+btnStart.BorderSizePixel = 0
 btnStart.TextColor3 = Color3.new(1, 1, 1)
 btnStart.Text = "▶ Запустить цикл"
 btnStart.Font = Enum.Font.GothamBold
@@ -322,8 +374,10 @@ btnStart.Parent = mainFrame
 round(btnStart, 8)
 
 local btnStop = Instance.new("TextButton")
+btnStop.LayoutOrder = 4
 btnStop.Size = UDim2.new(1, 0, 0, 34)
 btnStop.BackgroundColor3 = THEME.btnStop
+btnStop.BorderSizePixel = 0
 btnStop.TextColor3 = Color3.new(1, 1, 1)
 btnStop.Text = "⏹ Остановить"
 btnStop.Font = Enum.Font.GothamBold
@@ -347,8 +401,10 @@ end
 btnStop.MouseButton1Click:Connect(stopCycle)
 
 btnStart.MouseButton1Click:Connect(function()
-	if isRunning then return end
+	-- isBusy защищает от второго параллельного цикла после быстрого Стоп -> Старт
+	if isRunning or isBusy then return end
 	isRunning = true
+	isBusy = true
 
 	task.spawn(function()
 		for _, pipe in ipairs(PIPE_POSITIONS) do
@@ -365,6 +421,8 @@ btnStart.MouseButton1Click:Connect(function()
 			setStatus("Маршрут завершен!", THEME.statusOk)
 			isRunning = false
 		end
+		setNoClip(false)
+		isBusy = false
 	end)
 end)
 
