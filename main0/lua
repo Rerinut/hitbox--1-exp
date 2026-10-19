@@ -1,6 +1,4 @@
--- Standalone LocalScript: Naramato Manager v2 (Modern UI + Anti-Rollback)
--- Плавный полет (NoClip Tween) против отката + Переход по урону + Современный интерфейс
-
+-- Standalone LocalScript: Naramato Manager v2 (Fixed Anti-Rollback & Damage Trigger)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
@@ -13,17 +11,18 @@ local playerGui = player:WaitForChild("PlayerGui")
 -- НАСТРОЙКИ
 --------------------------------------------------------------------
 local CONFIG = {
-	USE_TWEEN = true,              -- true = плавный полет (обход античита/отката), false = мгновенный ТП
-	TWEEN_SPEED = 300,             -- скорость полета (студов/сек). 250-350 оптимально
-	TELEPORT_HEIGHT_OFFSET = 1,    -- смещение по высоте (1 студ, чтобы стоять прямо у трубы)
+	USE_TWEEN = true,              -- true = плавный полет (обход отката), false = мгновенный ТП
+	TWEEN_SPEED = 280,             -- 250-300 студов/сек оптимально для стабильной синхронизации
+	TELEPORT_HEIGHT_OFFSET = 0.5,  -- небольшое смещение, чтобы касаться триггера
 	STREAM_TIMEOUT = 5,            -- ожидание подгрузки чанков, сек
-	HIT_INTERVAL = 0.4,            -- интервал между ударами инструмента, сек
-	DAMAGE_EPSILON = 0.01,         -- минимальный урон для триггера перехода
-	BETWEEN_PIPES_PAUSE = 0.3,     -- пауза перед полетом к следующей трубе, сек
-	RESPAWN_WAIT = 15,             -- ожидание возрождения персонажа, сек
-	RETRIES_AFTER_DEATH = 1,       -- попыток повторить трубу при смерти
-	TOOL_NAME = nil,               -- nil = первый попавшийся инструмент
-	TOGGLE_KEY = Enum.KeyCode.RightControl, -- Клавиша скрыть/показать меню
+	HIT_INTERVAL = 0.4,            -- интервал ударов инструмента
+	DAMAGE_EPSILON = 0.01,         -- минимальный урон для фиксации перехода
+	DAMAGE_TIMEOUT = 3.5,          -- макс. время ожидания урона на трубе перед корректировкой
+	MAX_PIPE_RETRIES = 3,          -- попыток вернуть персонажа к трубе при откате
+	BETWEEN_PIPES_PAUSE = 0.3,     -- пауза перед полетом к следующей трубе
+	RESPAWN_WAIT = 15,             -- ожидание возрождения персонажа
+	TOOL_NAME = nil,               -- nil = первый инструмент из Backpack/Character
+	TOGGLE_KEY = Enum.KeyCode.RightControl,
 }
 
 local PIPE_POSITIONS = {
@@ -39,21 +38,15 @@ local PIPE_POSITIONS = {
 	{id = 10, name = "Труба 10", pos = Vector3.new(-3568.99, 93.50, 5742.89)},
 }
 
-local GENERATOR_POS = Vector3.new(-1714.53, 133.61, 3343.56)
-local COMMUNIC_POS = Vector3.new(-2708.10, 231.62, 3462.68)
-
 local THEME = {
 	bg = Color3.fromRGB(20, 22, 28),
 	card = Color3.fromRGB(28, 31, 38),
 	stroke = Color3.fromRGB(45, 50, 62),
 	text = Color3.fromRGB(240, 242, 245),
 	subtext = Color3.fromRGB(150, 155, 170),
-	
 	btnStart = Color3.fromRGB(38, 140, 75),
 	btnStop = Color3.fromRGB(180, 50, 50),
 	btnSelect = Color3.fromRGB(48, 105, 190),
-	btnTeleport = Color3.fromRGB(38, 42, 54),
-	
 	statusOk = Color3.fromRGB(80, 215, 120),
 	statusWarn = Color3.fromRGB(255, 195, 70),
 	statusErr = Color3.fromRGB(255, 90, 90),
@@ -61,7 +54,187 @@ local THEME = {
 }
 
 --------------------------------------------------------------------
--- ИНИЦИАЛИЗАЦИЯ ИНТЕРФЕЙСА
+-- СОСТОЯНИЕ
+--------------------------------------------------------------------
+local isRunning = false
+local currentTween = nil
+local noclipConnection = nil
+
+--------------------------------------------------------------------
+-- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФИЗИКИ И ПЕРЕМЕЩЕНИЯ
+--------------------------------------------------------------------
+local function setNoClip(enabled)
+	if noclipConnection then
+		noclipConnection:Disconnect()
+		noclipConnection = nil
+	end
+	if enabled then
+		noclipConnection = RunService.Stepped:Connect(function()
+			local char = player.Character
+			if char then
+				for _, part in ipairs(char:GetDescendants()) do
+					if part:IsA("BasePart") and part.CanCollide then
+						part.CanCollide = false
+					end
+				end
+			end
+		end)
+	end
+end
+
+local function getCharacterParts()
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hrp = char:WaitForChild("HumanoidRootPart", 5)
+	local hum = char:WaitForChild("Humanoid", 5)
+	return char, hrp, hum
+end
+
+local function resetVelocity(hrp)
+	if hrp then
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+	end
+end
+
+local function equipTool()
+	local char = player.Character
+	if not char then return nil end
+	
+	local tool = char:FindFirstChildOfClass("Tool")
+	if tool then return tool end
+
+	local backpack = player:FindFirstChild("Backpack")
+	if not backpack then return nil end
+
+	if CONFIG.TOOL_NAME then
+		tool = backpack:FindFirstChild(CONFIG.TOOL_NAME)
+	else
+		tool = backpack:FindFirstChildOfClass("Tool")
+	end
+
+	if tool then
+		tool.Parent = char
+		return tool
+	end
+	return nil
+end
+
+-- Перемещение с предзагрузкой и гашением инерции
+local function moveTo(targetPos)
+	local char, hrp, hum = getCharacterParts()
+	if not hrp or not hum or hum.Health <= 0 then return false end
+
+	pcall(function()
+		player:RequestStreamAroundAsync(targetPos, CONFIG.STREAM_TIMEOUT)
+	end)
+
+	local destCFrame = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
+
+	if CONFIG.USE_TWEEN then
+		setNoClip(true)
+		resetVelocity(hrp)
+
+		local distance = (hrp.Position - destCFrame.Position).Magnitude
+		local duration = math.clamp(distance / CONFIG.TWEEN_SPEED, 0.1, 15)
+
+		local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+		currentTween = TweenService:Create(hrp, tweenInfo, {CFrame = destCFrame})
+
+		local finished = false
+		local conn = currentTween.Completed:Connect(function() finished = true end)
+		currentTween:Play()
+
+		while not finished and isRunning and hum.Health > 0 do
+			task.wait(0.05)
+		end
+		conn:Disconnect()
+		currentTween = nil
+
+		resetVelocity(hrp)
+		task.wait(0.15)
+		setNoClip(false)
+	else
+		hrp.CFrame = destCFrame
+		resetVelocity(hrp)
+		task.wait(0.1)
+	end
+
+	return (hrp.Position - destCFrame.Position).Magnitude < 10
+end
+
+--------------------------------------------------------------------
+-- ОБРАБОТКА ТРУБЫ И КОНТРОЛЬ ПОЛУЧЕНИЯ УРОНА
+--------------------------------------------------------------------
+local function processPipe(pipe, updateStatus)
+	local retries = 0
+	local char, hrp, hum = getCharacterParts()
+	if not hum or hum.Health <= 0 then return false end
+
+	while retries < CONFIG.MAX_PIPE_RETRIES and isRunning do
+		updateStatus(string.format("Полет к %s (попытка %d)", pipe.name, retries + 1), THEME.btnSelect)
+		local reached = moveTo(pipe.pos)
+
+		char, hrp, hum = getCharacterParts()
+		if not hrp or not hum or hum.Health <= 0 then return false end
+
+		-- Проверка на мгновенный откат сервером
+		local dist = (hrp.Position - pipe.pos).Magnitude
+		if not reached or dist > 10 then
+			updateStatus("Обнаружен откат! Повторная синхронизация...", THEME.statusWarn)
+			retries = retries + 1
+			task.wait(0.4)
+		else
+			-- Мы на месте, ждем урон и активируем инструмент
+			updateStatus(string.format("На точке %s: ожидание урона...", pipe.name), THEME.statusOk)
+			
+			local initialHealth = hum.Health
+			local startTime = tick()
+			local tookDamage = false
+			local lastHit = 0
+
+			while isRunning and (tick() - startTime) < CONFIG.DAMAGE_TIMEOUT do
+				-- Проверка, не отбросил ли сервер персонажа во время ожидания
+				if (hrp.Position - pipe.pos).Magnitude > 10 then
+					updateStatus("Откат во время взаимодействия!", THEME.statusWarn)
+					break
+				end
+
+				-- Автоудар инструментом при необходимости
+				if tick() - lastHit >= CONFIG.HIT_INTERVAL then
+					lastHit = tick()
+					local tool = equipTool()
+					if tool then tool:Activate() end
+				end
+
+				-- Проверка фиксации урона
+				if (initialHealth - hum.Health) >= CONFIG.DAMAGE_EPSILON then
+					tookDamage = true
+					break
+				end
+
+				task.wait(0.05)
+			end
+
+			if tookDamage then
+				updateStatus(string.format("Урон получен на %s!", pipe.name), THEME.statusOk)
+				task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
+				return true
+			else
+				-- Если урон не пришел: смещаемся на полстуда ближе к трубе (микродоводка)
+				updateStatus("Урон не зафиксирован, корректировка позиции...", THEME.statusWarn)
+				retries = retries + 1
+				local nudge = (pipe.pos - hrp.Position).Unit * 0.5
+				hrp.CFrame = hrp.CFrame + nudge
+				task.wait(0.3)
+			end
+		end
+	end
+
+	return false
+end
+
+--------------------------------------------------------------------
+-- ИНТЕРФЕЙС
 --------------------------------------------------------------------
 local oldGui = playerGui:FindFirstChild("PipeNavigatorGui")
 if oldGui then oldGui:Destroy() end
@@ -75,7 +248,6 @@ local function round(obj, r)
 	local c = Instance.new("UICorner")
 	c.CornerRadius = UDim.new(0, r or 8)
 	c.Parent = obj
-	return c
 end
 
 local function stroke(obj, color, thickness)
@@ -84,103 +256,47 @@ local function stroke(obj, color, thickness)
 	s.Thickness = thickness or 1
 	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	s.Parent = obj
-	return s
 end
 
--- Плавающая кнопка развертывания
-local openBtn = Instance.new("TextButton")
-openBtn.Size = UDim2.new(0, 75, 0, 32)
-openBtn.Position = UDim2.new(0, 20, 0.45, 0)
-openBtn.BackgroundColor3 = THEME.bg
-openBtn.TextColor3 = THEME.text
-openBtn.Text = "⚡ Меню"
-openBtn.TextSize = 13
-openBtn.Font = Enum.Font.GothamBold
-openBtn.Visible = false
-openBtn.Parent = screenGui
-round(openBtn, 16)
-stroke(openBtn, THEME.stroke, 1.5)
-
--- Главный контейнер
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(0, 280, 0, 0)
 mainFrame.AutomaticSize = Enum.AutomaticSize.Y
 mainFrame.Position = UDim2.new(0, 25, 0.25, 0)
 mainFrame.BackgroundColor3 = THEME.bg
-mainFrame.BorderSizePixel = 0
 mainFrame.Parent = screenGui
 round(mainFrame, 12)
 stroke(mainFrame, THEME.stroke, 1.5)
 
 local mainLayout = Instance.new("UIListLayout")
 mainLayout.Padding = UDim.new(0, 10)
-mainLayout.SortOrder = Enum.SortOrder.LayoutOrder
 mainLayout.Parent = mainFrame
 
 local mainPadding = Instance.new("UIPadding")
 mainPadding.PaddingTop = UDim.new(0, 12)
-mainPadding.PaddingBottom = UDim.new(0, 14)
+mainPadding.PaddingBottom = UDim.new(0, 12)
 mainPadding.PaddingLeft = UDim.new(0, 12)
 mainPadding.PaddingRight = UDim.new(0, 12)
 mainPadding.Parent = mainFrame
 
--- Шапка
-local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 26)
-header.BackgroundTransparency = 1
-header.LayoutOrder = 1
-header.Parent = mainFrame
-
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -30, 1, 0)
+title.Size = UDim2.new(1, 0, 0, 20)
 title.BackgroundTransparency = 1
 title.TextColor3 = THEME.text
-title.Text = "⚡ Naramato Manager"
+title.Text = "⚡ Naramato Manager v2"
 title.Font = Enum.Font.GothamBold
-title.TextSize = 15
+title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
-title.Parent = header
+title.Parent = mainFrame
 
-local minimizeBtn = Instance.new("TextButton")
-minimizeBtn.Size = UDim2.new(0, 24, 0, 24)
-minimizeBtn.Position = UDim2.new(1, -24, 0, 1)
-minimizeBtn.BackgroundColor3 = THEME.card
-minimizeBtn.TextColor3 = THEME.subtext
-minimizeBtn.Text = "—"
-minimizeBtn.Font = Enum.Font.GothamBold
-minimizeBtn.TextSize = 13
-minimizeBtn.Parent = header
-round(minimizeBtn, 6)
-stroke(minimizeBtn, THEME.stroke, 1)
-
--- Карточка статуса
 local statusCard = Instance.new("Frame")
-statusCard.Size = UDim2.new(1, 0, 0, 0)
-statusCard.AutomaticSize = Enum.AutomaticSize.Y
+statusCard.Size = UDim2.new(1, 0, 0, 36)
 statusCard.BackgroundColor3 = THEME.card
-statusCard.LayoutOrder = 2
 statusCard.Parent = mainFrame
 round(statusCard, 8)
-stroke(statusCard, THEME.stroke, 1)
-
-local statusPadding = Instance.new("UIPadding")
-statusPadding.PaddingTop = UDim.new(0, 8)
-statusPadding.PaddingBottom = UDim.new(0, 8)
-statusPadding.PaddingLeft = UDim.new(0, 10)
-statusPadding.PaddingRight = UDim.new(0, 10)
-statusPadding.Parent = statusCard
-
-local statusDot = Instance.new("Frame")
-statusDot.Size = UDim2.new(0, 8, 0, 8)
-statusDot.Position = UDim2.new(0, 0, 0, 5)
-statusDot.BackgroundColor3 = THEME.statusIdle
-statusDot.Parent = statusCard
-round(statusDot, 4)
 
 local statusText = Instance.new("TextLabel")
-statusText.Size = UDim2.new(1, -16, 0, 0)
-statusText.Position = UDim2.new(0, 16, 0, 0)
-statusText.AutomaticSize = Enum.AutomaticSize.Y
+statusText.Size = UDim2.new(1, -16, 1, 0)
+statusText.Position = UDim2.new(0, 8, 0, 0)
 statusText.BackgroundTransparency = 1
 statusText.TextColor3 = THEME.text
 statusText.Text = "Готов к работе"
@@ -192,41 +308,68 @@ statusText.Parent = statusCard
 
 local function setStatus(text, color)
 	statusText.Text = text
-	statusDot.BackgroundColor3 = color or THEME.statusIdle
+	statusText.TextColor3 = color or THEME.text
 end
 
--- Кнопки действий
-local actionGrid = Instance.new("Frame")
-actionGrid.Size = UDim2.new(1, 0, 0, 36)
-actionGrid.BackgroundTransparency = 1
-actionGrid.LayoutOrder = 3
-actionGrid.Parent = mainFrame
-
 local btnStart = Instance.new("TextButton")
-btnStart.Size = UDim2.new(0.68, -4, 1, 0)
+btnStart.Size = UDim2.new(1, 0, 0, 34)
 btnStart.BackgroundColor3 = THEME.btnStart
 btnStart.TextColor3 = Color3.new(1, 1, 1)
-btnStart.Text = "▶ Все трубы"
+btnStart.Text = "▶ Запустить цикл"
 btnStart.Font = Enum.Font.GothamBold
 btnStart.TextSize = 13
-btnStart.Parent = actionGrid
+btnStart.Parent = mainFrame
 round(btnStart, 8)
 
 local btnStop = Instance.new("TextButton")
-btnStop.Size = UDim2.new(0.32, 0, 1, 0)
-btnStop.Position = UDim2.new(0.68, 4, 0, 0)
+btnStop.Size = UDim2.new(1, 0, 0, 34)
 btnStop.BackgroundColor3 = THEME.btnStop
 btnStop.TextColor3 = Color3.new(1, 1, 1)
-btnStop.Text = "⏹ Стоп"
+btnStop.Text = "⏹ Остановить"
 btnStop.Font = Enum.Font.GothamBold
 btnStop.TextSize = 13
-btnStop.Parent = actionGrid
+btnStop.Parent = mainFrame
 round(btnStop, 8)
 
-local btnSelect = Instance.new("TextButton")
-btnSelect.Size = UDim2.new(1, 0, 0, 32)
-btnSelect.BackgroundColor3 = THEME.btnSelect
-btnSelect.TextColor3 = Color3.new(1, 1, 1)
-btnSelect.Text = "📋 Выбрать трубу..."
-btnSelect.Font = Enum.Font.GothamMedium
-btnSelect.Text
+--------------------------------------------------------------------
+-- УПРАВЛЕНИЕ ЦИКЛОМ
+--------------------------------------------------------------------
+local function stopCycle()
+	isRunning = false
+	if currentTween then
+		currentTween:Cancel()
+		currentTween = nil
+	end
+	setNoClip(false)
+	setStatus("Остановлено", THEME.statusIdle)
+end
+
+btnStop.MouseButton1Click:Connect(stopCycle)
+
+btnStart.MouseButton1Click:Connect(function()
+	if isRunning then return end
+	isRunning = true
+
+	task.spawn(function()
+		for _, pipe in ipairs(PIPE_POSITIONS) do
+			if not isRunning then break end
+
+			local success = processPipe(pipe, setStatus)
+			if not success and isRunning then
+				setStatus(string.format("Пропуск %s: нет урона", pipe.name), THEME.statusWarn)
+				task.wait(0.5)
+			end
+		end
+
+		if isRunning then
+			setStatus("Маршрут завершен!", THEME.statusOk)
+			isRunning = false
+		end
+	end)
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == CONFIG.TOGGLE_KEY then
+		mainFrame.Visible = not mainFrame.Visible
+	end
+end)
