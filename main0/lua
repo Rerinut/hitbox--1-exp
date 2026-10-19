@@ -1,4 +1,4 @@
--- Standalone LocalScript: Naramato Manager v2 (Infinite TP Lock Until Damage)
+-- Standalone LocalScript: Naramato Manager v2 (Strict Verified Pipe Damage Lock)
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -11,10 +11,13 @@ local playerGui = player:WaitForChild("PlayerGui")
 --------------------------------------------------------------------
 local CONFIG = {
 	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте у трубы
-	TP_LOOP_INTERVAL = 0.05,       -- частота повторного ТП к трубе (сек)
+	TP_LOOP_INTERVAL = 0.04,       -- частота удержания позиции (сек)
+	STABILIZE_TIME = 0.8,          -- сколько сек нужно простоять у новой трубы без отката до включения датчика
+	MAX_VALID_DIST = 4.5,          -- макс. радиус от трубы, внутри которого урон считается валидным
+	JIGGLE_RADIUS = 0.25,          -- микро-смещение для срабатывания серверного .Touched трубы
 	HIT_INTERVAL = 0.35,           -- интервал ударов инструментом (сек)
-	DAMAGE_EPSILON = 0.01,         -- минимальный урон для срабатывания датчика
-	BETWEEN_PIPES_PAUSE = 0.25,    -- пауза после урона перед следующей трубой
+	DAMAGE_EPSILON = 0.1,          -- минимальный урон для срабатывания датчика
+	BETWEEN_PIPES_PAUSE = 0.4,     -- пауза после урона перед следующей трубой
 	STREAM_TIMEOUT = 3,            -- подгрузка чанков
 	TOOL_NAME = nil,               -- nil = брать любой инструмент
 	TOGGLE_KEY = Enum.KeyCode.RightControl,
@@ -55,7 +58,7 @@ local isRunning = false
 local noclipConn = nil
 
 --------------------------------------------------------------------
--- ФИЗИКА И ТЕЛЕПОРТ
+-- ФИЗИКА И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 --------------------------------------------------------------------
 local function setNoClip(state)
 	if noclipConn then
@@ -67,8 +70,9 @@ local function setNoClip(state)
 			local char = player.Character
 			if char then
 				for _, part in ipairs(char:GetDescendants()) do
-					if part:IsA("BasePart") and part.CanCollide then
+					if part:IsA("BasePart") then
 						part.CanCollide = false
+						part.CanTouch = true -- Гарантируем работу .Touched для получения урона от трубы
 					end
 				end
 			end
@@ -100,7 +104,6 @@ local function equipTool()
 	return nil
 end
 
--- Одиночный быстрый ТП (для Генератора, Коммуникации и ручного выбора)
 local function quickTeleport(targetPos)
 	local _, hrp, hum = getCharParts()
 	if not hrp or not hum or hum.Health <= 0 then return end
@@ -110,7 +113,7 @@ local function quickTeleport(targetPos)
 	end)
 
 	local dest = CFrame.new(targetPos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
-	for _ = 1, 5 do
+	for _ = 1, 6 do
 		hrp.CFrame = dest
 		hrp.AssemblyLinearVelocity = Vector3.zero
 		hrp.AssemblyAngularVelocity = Vector3.zero
@@ -119,14 +122,14 @@ local function quickTeleport(targetPos)
 end
 
 --------------------------------------------------------------------
--- БЕСКОНЕЧНЫЙ ТП К ТРУБЕ ДО ПОЛУЧЕНИЯ УРОНА
+-- СТРОГИЙ ЗАХВАТ ТРУБЫ ДО ПОДТВЕРЖДЕННОГО УРОНА
 --------------------------------------------------------------------
-local function teleportUntilDamage(pipe, updateStatus)
+local function teleportUntilVerifiedDamage(pipe, updateStatus)
 	pcall(function()
 		player:RequestStreamAroundAsync(pipe.pos, CONFIG.STREAM_TIMEOUT)
 	end)
 
-	local destCFrame = CFrame.new(pipe.pos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0))
+	local basePos = pipe.pos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
 
 	while isRunning do
 		local _, hrp, hum = getCharParts()
@@ -135,37 +138,75 @@ local function teleportUntilDamage(pipe, updateStatus)
 			continue
 		end
 
-		-- Если персонаж мертв, ждем возрождения и повторяем эту же трубу
+		-- Если персонаж погиб, ждем респавна и остаемся на ЭТОЙ ЖЕ трубе
 		if hum.Health <= 0 then
-			updateStatus("Персонаж погиб, ждем респавн...", THEME.statusWarn)
+			updateStatus("Смерть! Ждем респавн для " .. pipe.name, THEME.statusWarn)
 			player.CharacterAdded:Wait()
-			task.wait(1)
+			task.wait(1.2)
 			continue
 		end
 
-		local tookDamage = false
+		local tookVerifiedDamage = false
+		local sensorArmed = false
+		local stableSince = tick()
 		local lastHealth = hum.Health
+		local lastHit = 0
+		local stepAngle = 0
 
-		-- Подписка на изменение здоровья (с учетом возможной регенерации)
+		-- Слушатель урона: срабатывает ТОЛЬКО если датчик взведен и мы реально у трубы
 		local healthConn
 		healthConn = hum.HealthChanged:Connect(function(newHealth)
-			if newHealth > 0 and (lastHealth - newHealth) >= CONFIG.DAMAGE_EPSILON then
-				tookDamage = true
+			if newHealth <= 0 then return end
+
+			local distToPipe = (hrp.Position - basePos).Magnitude
+			local isAtPipe = distToPipe <= CONFIG.MAX_VALID_DIST
+
+			if sensorArmed and isAtPipe and (lastHealth - newHealth) >= CONFIG.DAMAGE_EPSILON then
+				tookVerifiedDamage = true
 			else
+				-- Игнорируем ложный/остаточный урон и обновляем базу ХП
 				lastHealth = newHealth
 			end
 		end)
 
 		setNoClip(true)
-		updateStatus(string.format("Удерживаем %s (ждем урон)...", pipe.name), THEME.btnAction)
 
-		local lastHit = 0
-		-- Телепортируем в точку каждые TP_LOOP_INTERVAL секунд, пока не пройдет урон
-		while isRunning and not tookDamage and hum.Health > 0 do
-			hrp.CFrame = destCFrame
+		while isRunning and not tookVerifiedDamage and hum.Health > 0 do
+			-- Проверяем, не отбросил ли нас сервер ДО следующего принудительного ТП
+			local currentDist = (hrp.Position - basePos).Magnitude
+			if currentDist > CONFIG.MAX_VALID_DIST then
+				-- Нас откатило! Сбрасываем таймер стабилизации и блокируем датчик
+				sensorArmed = false
+				stableSince = tick()
+				lastHealth = hum.Health
+				updateStatus(string.format("%s: откат! Возвращаем...", pipe.name), THEME.statusWarn)
+			else
+				-- Мы находимся у трубы: проверяем, прошло ли время стабилизации
+				if not sensorArmed then
+					local elapsed = tick() - stableSince
+					if elapsed >= CONFIG.STABILIZE_TIME then
+						sensorArmed = true
+						lastHealth = hum.Health
+						updateStatus(string.format("%s: датчик активен, ждем урон", pipe.name), THEME.statusOk)
+					else
+						updateStatus(string.format("%s: закрепление (%.1fс)...", pipe.name, CONFIG.STABILIZE_TIME - elapsed), THEME.btnAction)
+					end
+				end
+			end
+
+			-- Микро-колебание на месте, чтобы физика Roblox вызывала .Touched у трубы
+			stepAngle = stepAngle + 1.2
+			local jiggleOffset = Vector3.new(
+				math.cos(stepAngle) * CONFIG.JIGGLE_RADIUS,
+				0,
+				math.sin(stepAngle) * CONFIG.JIGGLE_RADIUS
+			)
+
+			hrp.CFrame = CFrame.new(basePos + jiggleOffset)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
 
+			-- Автоудар инструментом
 			if tick() - lastHit >= CONFIG.HIT_INTERVAL then
 				lastHit = tick()
 				local tool = equipTool()
@@ -178,8 +219,8 @@ local function teleportUntilDamage(pipe, updateStatus)
 		if healthConn then healthConn:Disconnect() end
 		setNoClip(false)
 
-		if tookDamage then
-			updateStatus(string.format("Урон получен на %s! Переход...", pipe.name), THEME.statusOk)
+		if tookVerifiedDamage then
+			updateStatus(string.format("Урон от %s подтвержден!", pipe.name), THEME.statusOk)
 			task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
 			return true
 		end
@@ -383,13 +424,12 @@ pipeListPad.PaddingLeft = UDim.new(0, 6)
 pipeListPad.PaddingRight = UDim.new(0, 6)
 pipeListPad.Parent = pipesListFrame
 
--- При нажатии на отдельную трубу тоже удерживает на ней до получения урона
 for _, pipe in ipairs(PIPE_POSITIONS) do
 	local pBtn = Instance.new("TextButton")
 	pBtn.Size = UDim2.new(1, -6, 0, 26)
 	pBtn.BackgroundColor3 = THEME.bg
 	pBtn.TextColor3 = THEME.text
-	pBtn.Text = string.format("Труба %d (ТП до урона)", pipe.id)
+	pBtn.Text = string.format("Труба %d (держать до урона)", pipe.id)
 	pBtn.Font = Enum.Font.Gotham
 	pBtn.TextSize = 12
 	pBtn.Parent = pipesListFrame
@@ -399,9 +439,9 @@ for _, pipe in ipairs(PIPE_POSITIONS) do
 		if isRunning then return end
 		isRunning = true
 		task.spawn(function()
-			teleportUntilDamage(pipe, setStatus)
+			teleportUntilVerifiedDamage(pipe, setStatus)
 			if isRunning then
-				setStatus(string.format("%s готова!", pipe.name), THEME.statusOk)
+				setStatus(string.format("%s пройдена!", pipe.name), THEME.statusOk)
 				isRunning = false
 			end
 		end)
@@ -445,7 +485,7 @@ btnStart.MouseButton1Click:Connect(function()
 	task.spawn(function()
 		for _, pipe in ipairs(PIPE_POSITIONS) do
 			if not isRunning then break end
-			teleportUntilDamage(pipe, setStatus)
+			teleportUntilVerifiedDamage(pipe, setStatus)
 		end
 
 		if isRunning then
