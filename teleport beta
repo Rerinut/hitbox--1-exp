@@ -5,6 +5,8 @@
 -- v2.1: в паузу позиция не трогается, но скорости обнуляются (персонаж не
 -- падает с ноклипом), а стрельба разрешена только в "чистом окне" после ТП
 -- (SHOOT_DELAY_AFTER_TP .. +SHOOT_WINDOW), когда сервер уже принял позицию.
+-- v2.2: автоэкипировка оружия удалена (мешала) — стреляем только тем, что уже
+-- в руках; окно стрельбы расширено до 0.8с, интервал выстрела ускорен до 0.2с.
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -20,15 +22,14 @@ local CONFIG = {
 	TP_LOOP_INTERVAL = 0.04,        -- частота проверки позиции/датчика (сек)
 	TELEPORT_PAUSE = 0.75,          -- ПАУЗА между повторными телепортами: в паузу позицию не трогаем
 	SHOOT_DELAY_AFTER_TP = 0.1,    -- задержка после телепорта перед выстрелом: сервер должен успеть принять позицию
-	SHOOT_WINDOW = 0.5,            -- сколько сек после телепорта разрешена стрельба (дальше ждем следующий ТП)
+	SHOOT_WINDOW = 0.8,            -- сколько сек после телепорта разрешена стрельба (дальше ждем следующий ТП)
 	STABILIZE_TIME = 0.8,          -- сколько сек нужно простоять у новой трубы без отката до включения датчика
 	MAX_VALID_DIST = 4.5,          -- макс. радиус от трубы, внутри которого урон считается валидным
 	JIGGLE_RADIUS = 0.25,          -- микро-смещение для срабатывания серверного .Touched трубы
-	HIT_INTERVAL = 0.35,           -- интервал ударов инструментом (сек)
+	HIT_INTERVAL = 0.2,            -- интервал выстрелов (сек)
 	DAMAGE_EPSILON = 0.1,          -- минимальный урон для срабатывания датчика
 	BETWEEN_PIPES_PAUSE = 0.4,     -- пауза после урона перед следующей трубой
 	STREAM_TIMEOUT = 3,            -- подгрузка чанков
-	TOOL_NAME = nil,               -- nil = брать любой инструмент
 	TOGGLE_KEY = Enum.KeyCode.RightControl,
 	SPECIAL_HOLD_TIME = 5.0,       -- Время удержания/повтора у генератора и коммуникаций (сек)
 }
@@ -125,28 +126,8 @@ local function waitForRespawn()
 	end
 end
 
-local function equipTool()
-	local char = player.Character
-	if not char then return nil end
-	local tool = char:FindFirstChildOfClass("Tool")
-	if tool then return tool end
-
-	local backpack = player:FindFirstChild("Backpack")
-	if not backpack then return nil end
-
-	if CONFIG.TOOL_NAME then
-		tool = backpack:FindFirstChild(CONFIG.TOOL_NAME)
-	else
-		tool = backpack:FindFirstChildOfClass("Tool")
-	end
-
-	if tool then
-		tool.Parent = char
-		return nil -- только что экипировали: даем серверу увидеть тулзу в руках,
-		           -- иначе первый Activate уходит "в молоко" (часть фикса урона)
-	end
-	return nil
-end
+-- Автоэкипировки НЕТ (v2.2): она мешала — скрипт стреляет только тем,
+-- что уже держишь в руках сам
 
 local function quickTeleport(targetPos, updateStatus)
 	local _, hrp, hum = getCharParts()
@@ -278,14 +259,21 @@ local function teleportUntilVerifiedDamage(pipe, updateStatus)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
 
-			-- Автоудар инструментом: только в "чистом" окне после телепорта —
-			-- не сразу (сервер должен принять новую позицию) и не в конце паузы
+			-- Автовыстрел (оружие держишь в руках сам): только в "чистом" окне
+			-- после телепорта — не сразу и не в конце паузы
 			local sinceTp = tick() - lastTp
 			if sinceTp >= CONFIG.SHOOT_DELAY_AFTER_TP and sinceTp <= CONFIG.SHOOT_DELAY_AFTER_TP + CONFIG.SHOOT_WINDOW then
 				if tick() - lastHit >= CONFIG.HIT_INTERVAL then
 					lastHit = tick()
-					local tool = equipTool()
-					if tool then tool:Activate() end
+					local char = player.Character
+					local tool = char and char:FindFirstChildOfClass("Tool")
+					if tool then
+						-- pcall: некоторые тулзы кидают ошибку из Activate,
+						-- одна кривая пушка не должна ронять весь прогон
+						pcall(function() tool:Activate() end)
+					else
+						updateStatus(pipe.name .. ": оружие не в руках! Возьми пушку сам", THEME.statusWarn)
+					end
 				end
 			end
 
