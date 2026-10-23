@@ -7,13 +7,15 @@
 --   * tick() -> os.clock(); экипировка через Humanoid:EquipTool; pcall вокруг Activate
 --   * UI собран на хелперах create/decor, добавлены перетаскивание окна и
 --     обрезка длинного статуса
--- v3.1:
---   * прицел: во время удержания у трубы камера принудительно наведена на неё
---     (рейкаст-оружие бьет от камеры — раньше выстрелы летели мимо)
---   * камера вынесена за геометрию трубы: луч, начавшийся внутри детали,
---     не регистрирует попадание по ней самой
---   * первый Activate после экипировки пропускается: сервер еще не увидел
---     тулзу в руках и отбрасывал такие выстрелы
+-- v3.2:
+--   * координаты из списка НЕ трогаем (они уже подобраны рядом с трубой):
+--     персонаж стоит на своей точке, камера остается у головы и просто
+--     разворачивается на деталь трубы — раньше выстрелы шли мимо, потому
+--     что никто не задавал направление камеры
+--   * FIRE_MODE = "mouse" — стрельба кликом ЛКМ через VirtualInputManager,
+--     для пушек, которые игнорируют Tool:Activate()
+--   * первый выстрел после экипировки пропускается: сервер еще не увидел
+--     тулзу в руках и отбрасывал такой Activate
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -41,11 +43,9 @@ local CONFIG = {
 	GENERATOR_HOLD_TIME = 5.0,    -- удержание у генератора (сек)
 	COMMUNIC_HOLD_TIME = 5.0,     -- удержание у коммуникаций (сек)
 	QUICK_TP_JUMP = true,         -- имитировать прыжки при удержании у генератора/коммуникаций
-	AIM_AT_PIPE = true,           -- наводить камеру на трубу во время удержания (см. v3.1)
-	AIM_CAMERA_DISTANCE = 4,      -- на сколько студов отодвинуть камеру от центра трубы
-	AIM_CAMERA_HEIGHT = 0.5,      -- подъем камеры над центром трубы
-	STAND_DISTANCE = 0,           -- 0 = стоять в центре трубы (как раньше); ~3 = снаружи, для оружия, стреляющего из дула
+	AIM_AT_PIPE = true,           -- во время удержания камера смотрит на трубу от точки стояния
 	PIPE_SCAN_RADIUS = 8,         -- радиус поиска реальной детали трубы вокруг координаты из списка
+	FIRE_MODE = "activate",       -- "activate" = Tool:Activate(); "mouse" = клик ЛКМ через VirtualInputManager
 }
 
 local PIPE_POSITIONS = {
@@ -133,10 +133,9 @@ end
 --------------------------------------------------------------------
 -- ПРИЦЕЛ НА ТРУБУ
 -- Большинство оружейных тулз в Roblox рейкастят от камеры (или от курсора,
--- чей луч строится от камеры). Раньше скрипт не задавал ни позу, ни камеру —
--- выстрелы уходили в случайную сторону. Плюс луч, начавшийся ВНУТРИ детали
--- трубы, не регистрирует попадание по ней самой, поэтому камеру выносим
--- наружу на AIM_CAMERA_DISTANCE.
+-- чей луч строится от камеры). Точку стояния из списка НЕ трогаем — она уже
+-- подобрана рядом с трубой; камера остается у головы персонажа и каждый кадр
+-- разворачивается на найденную деталь трубы.
 --------------------------------------------------------------------
 local AIM_BIND_NAME = "NaramatoAim"
 local aimBound = false
@@ -150,18 +149,17 @@ end
 
 local function startAiming(target)
 	stopAiming()
-	if not target or CONFIG.AIM_CAMERA_DISTANCE <= 0 then return end
+	if not target or not CONFIG.AIM_AT_PIPE then return end
 
 	aimBound = true
-	local standDir = Vector3.new(1, 0, 0)
-	local anchor = target + standDir * CONFIG.AIM_CAMERA_DISTANCE + Vector3.new(0, CONFIG.AIM_CAMERA_HEIGHT, 0)
-
 	-- приоритет выше дефолтного контроллера камеры, иначе он перезапишет CFrame
 	RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function()
 		if not aimBound then return end
+		local char = player.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
 		local cam = workspace.CurrentCamera
-		if cam then
-			cam.CFrame = CFrame.lookAt(anchor, target)
+		if hrp and cam and (hrp.Position - target).Magnitude > 0.5 then
+			cam.CFrame = CFrame.lookAt(hrp.Position, target)
 		end
 	end)
 end
@@ -180,7 +178,7 @@ local function findPipeCenter(pos)
 			best = part
 		end
 	end
-	return best and best.Position or pos
+	return best and best.Position or pos, best
 end
 
 local function getCharParts()
@@ -234,6 +232,26 @@ local function equipTool()
 	return nil
 end
 
+-- Виртуальная мышь доступна только из исполнителя; в обычном LocalScript
+-- методы защищены и каждый вызов упадет в pcall — тогда стреляем через Activate
+local okVIM, VirtualInputManager = pcall(game.GetService, game, "VirtualInputManager")
+
+local function fireTool(tool)
+	if CONFIG.FIRE_MODE == "mouse" and VirtualInputManager then
+		local cam = workspace.CurrentCamera
+		local x = cam.ViewportSize.X / 2
+		local y = cam.ViewportSize.Y / 2
+		-- клик ЛКМ в центр экрана: работает и для пушек, которые не слушают
+		-- Tool.Activated, а ловят нажатия мыши/ContextActionService
+		local ok = pcall(VirtualInputManager.SendMouseButtonEvent, VirtualInputManager, x, y, 0, true, game, 0)
+		task.delay(0.05, function()
+			pcall(VirtualInputManager.SendMouseButtonEvent, VirtualInputManager, x, y, 0, false, game, 0)
+		end)
+		if ok then return end
+	end
+	pcall(tool.Activate, tool)
+end
+
 local function quickTeleport(targetPos, id, updateStatus, holdTime)
 	holdTime = holdTime or 5
 	local _, hrp, hum = getCharParts()
@@ -270,22 +288,20 @@ end
 local function teleportUntilVerifiedDamage(pipe, id, updateStatus)
 	pcall(player.RequestStreamAroundAsync, player, pipe.pos, CONFIG.STREAM_TIMEOUT)
 
-	local standDir = Vector3.new(1, 0, 0)
-	local aimPoint = findPipeCenter(pipe.pos)
-	local basePos = pipe.pos + standDir * CONFIG.STAND_DISTANCE + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
+	local aimPoint, aimPart = findPipeCenter(pipe.pos)
+	local basePos = pipe.pos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
 	local startedAt = os.clock()
+	local targetLabel = aimPart and aimPart.Name or "по координате"
 
-	-- Если стоим ровно над центром трубы (STAND_DISTANCE = 0), lookAt на сам
-	-- центр вырождается — разворачиваем персонажа "сквозь" трубу наружу
+	-- Персонаж стоит ровно на координате из списка (позицию не двигаем)
+	-- и разворачивается лицом к найденной детали трубы
 	local facePoint = aimPoint
-	if (Vector3.new(basePos.X, 0, basePos.Z) - Vector3.new(aimPoint.X, 0, aimPoint.Z)).Magnitude < 0.05 then
-		facePoint = aimPoint + standDir * 2
+	if (basePos - aimPoint).Magnitude < 0.5 then
+		facePoint = aimPoint + Vector3.new(2, 0, 0) -- защита от вырожденного lookAt
 	end
 
 	setNoClip(true)
-	if CONFIG.AIM_AT_PIPE then
-		startAiming(aimPoint)
-	end
+	startAiming(aimPoint)
 
 	while isCurrent(id) do
 		if CONFIG.PIPE_TIMEOUT > 0 and os.clock() - startedAt >= CONFIG.PIPE_TIMEOUT then
@@ -344,7 +360,7 @@ local function teleportUntilVerifiedDamage(pipe, id, updateStatus)
 				if elapsed >= CONFIG.STABILIZE_TIME then
 					sensorArmed = true
 					lastHealth = hum.Health
-					updateStatus(string.format("%s: датчик активен, ждем урон", pipe.name), THEME.statusOk)
+					updateStatus(string.format("%s: датчик активен, цель: %s", pipe.name, targetLabel), THEME.statusOk)
 				else
 					updateStatus(string.format("%s: закрепление (%.1fс)...", pipe.name, CONFIG.STABILIZE_TIME - elapsed), THEME.btnAction)
 				end
@@ -366,7 +382,7 @@ local function teleportUntilVerifiedDamage(pipe, id, updateStatus)
 			if os.clock() - lastHit >= CONFIG.HIT_INTERVAL then
 				lastHit = os.clock()
 				local tool = equipTool()
-				if tool then pcall(tool.Activate, tool) end
+				if tool then fireTool(tool) end
 			end
 
 			task.wait(CONFIG.TP_LOOP_INTERVAL)
