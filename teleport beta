@@ -7,6 +7,13 @@
 --   * tick() -> os.clock(); экипировка через Humanoid:EquipTool; pcall вокруг Activate
 --   * UI собран на хелперах create/decor, добавлены перетаскивание окна и
 --     обрезка длинного статуса
+-- v3.1:
+--   * прицел: во время удержания у трубы камера принудительно наведена на неё
+--     (рейкаст-оружие бьет от камеры — раньше выстрелы летели мимо)
+--   * камера вынесена за геометрию трубы: луч, начавшийся внутри детали,
+--     не регистрирует попадание по ней самой
+--   * первый Activate после экипировки пропускается: сервер еще не увидел
+--     тулзу в руках и отбрасывал такие выстрелы
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -34,6 +41,11 @@ local CONFIG = {
 	GENERATOR_HOLD_TIME = 5.0,    -- удержание у генератора (сек)
 	COMMUNIC_HOLD_TIME = 5.0,     -- удержание у коммуникаций (сек)
 	QUICK_TP_JUMP = true,         -- имитировать прыжки при удержании у генератора/коммуникаций
+	AIM_AT_PIPE = true,           -- наводить камеру на трубу во время удержания (см. v3.1)
+	AIM_CAMERA_DISTANCE = 4,      -- на сколько студов отодвинуть камеру от центра трубы
+	AIM_CAMERA_HEIGHT = 0.5,      -- подъем камеры над центром трубы
+	STAND_DISTANCE = 0,           -- 0 = стоять в центре трубы (как раньше); ~3 = снаружи, для оружия, стреляющего из дула
+	PIPE_SCAN_RADIUS = 8,         -- радиус поиска реальной детали трубы вокруг координаты из списка
 }
 
 local PIPE_POSITIONS = {
@@ -118,6 +130,59 @@ local function setNoClip(state)
 	end
 end
 
+--------------------------------------------------------------------
+-- ПРИЦЕЛ НА ТРУБУ
+-- Большинство оружейных тулз в Roblox рейкастят от камеры (или от курсора,
+-- чей луч строится от камеры). Раньше скрипт не задавал ни позу, ни камеру —
+-- выстрелы уходили в случайную сторону. Плюс луч, начавшийся ВНУТРИ детали
+-- трубы, не регистрирует попадание по ней самой, поэтому камеру выносим
+-- наружу на AIM_CAMERA_DISTANCE.
+--------------------------------------------------------------------
+local AIM_BIND_NAME = "NaramatoAim"
+local aimBound = false
+
+local function stopAiming()
+	if aimBound then
+		aimBound = false
+		RunService:UnbindFromRenderStep(AIM_BIND_NAME)
+	end
+end
+
+local function startAiming(target)
+	stopAiming()
+	if not target or CONFIG.AIM_CAMERA_DISTANCE <= 0 then return end
+
+	aimBound = true
+	local standDir = Vector3.new(1, 0, 0)
+	local anchor = target + standDir * CONFIG.AIM_CAMERA_DISTANCE + Vector3.new(0, CONFIG.AIM_CAMERA_HEIGHT, 0)
+
+	-- приоритет выше дефолтного контроллера камеры, иначе он перезапишет CFrame
+	RunService:BindToRenderStep(AIM_BIND_NAME, Enum.RenderPriority.Camera.Value + 1, function()
+		if not aimBound then return end
+		local cam = workspace.CurrentCamera
+		if cam then
+			cam.CFrame = CFrame.lookAt(anchor, target)
+		end
+	end)
+end
+
+-- Ищем реальную деталь трубы рядом с координатой из списка и целимся в её центр
+local function findPipeCenter(pos)
+	local char = player.Character
+	local best, bestDist = nil, math.huge
+	for _, part in ipairs(workspace:GetPartBoundsInRadius(pos, CONFIG.PIPE_SCAN_RADIUS)) do
+		if part:IsA("Terrain") then continue end
+		if char and part:IsDescendantOf(char) then continue end
+		if math.max(part.Size.X, part.Size.Y, part.Size.Z) > 40 then continue end -- пол/стены карты
+		local d = (part.Position - pos).Magnitude
+		if d < bestDist then
+			bestDist = d
+			best = part
+		end
+	end
+	return best and best.Position or pos
+end
+
 local function getCharParts()
 	local char = player.Character or player.CharacterAdded:Wait()
 	local hrp = char:WaitForChild("HumanoidRootPart", 10)
@@ -162,8 +227,11 @@ local function equipTool()
 		else
 			tool.Parent = char
 		end
+		-- Экипировка должна дойти до сервера (~0.1с): Activate в тот же тик
+		-- сервер отбрасывает — стреляем со следующего интервала
+		return nil
 	end
-	return tool
+	return nil
 end
 
 local function quickTeleport(targetPos, id, updateStatus, holdTime)
@@ -202,14 +270,27 @@ end
 local function teleportUntilVerifiedDamage(pipe, id, updateStatus)
 	pcall(player.RequestStreamAroundAsync, player, pipe.pos, CONFIG.STREAM_TIMEOUT)
 
-	local basePos = pipe.pos + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
+	local standDir = Vector3.new(1, 0, 0)
+	local aimPoint = findPipeCenter(pipe.pos)
+	local basePos = pipe.pos + standDir * CONFIG.STAND_DISTANCE + Vector3.new(0, CONFIG.TELEPORT_HEIGHT_OFFSET, 0)
 	local startedAt = os.clock()
 
+	-- Если стоим ровно над центром трубы (STAND_DISTANCE = 0), lookAt на сам
+	-- центр вырождается — разворачиваем персонажа "сквозь" трубу наружу
+	local facePoint = aimPoint
+	if (Vector3.new(basePos.X, 0, basePos.Z) - Vector3.new(aimPoint.X, 0, aimPoint.Z)).Magnitude < 0.05 then
+		facePoint = aimPoint + standDir * 2
+	end
+
 	setNoClip(true)
+	if CONFIG.AIM_AT_PIPE then
+		startAiming(aimPoint)
+	end
 
 	while isCurrent(id) do
 		if CONFIG.PIPE_TIMEOUT > 0 and os.clock() - startedAt >= CONFIG.PIPE_TIMEOUT then
 			updateStatus(string.format("%s: не дождались урона за %dс, пропускаем", pipe.name, CONFIG.PIPE_TIMEOUT), THEME.statusWarn)
+			stopAiming()
 			return false
 		end
 
@@ -277,7 +358,7 @@ local function teleportUntilVerifiedDamage(pipe, id, updateStatus)
 				math.sin(stepAngle) * CONFIG.JIGGLE_RADIUS
 			)
 
-			hrp.CFrame = CFrame.new(basePos + jiggleOffset)
+			hrp.CFrame = CFrame.lookAt(basePos + jiggleOffset, facePoint)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 			hrp.AssemblyAngularVelocity = Vector3.zero
 
@@ -295,11 +376,13 @@ local function teleportUntilVerifiedDamage(pipe, id, updateStatus)
 
 		if tookVerifiedDamage then
 			updateStatus(string.format("Урон от %s подтвержден!", pipe.name), THEME.statusOk)
+			stopAiming()
 			task.wait(CONFIG.BETWEEN_PIPES_PAUSE)
 			return true
 		end
 	end
 
+	stopAiming()
 	return false
 end
 
@@ -554,6 +637,7 @@ create("UIPadding", {
 local function cancelRun()
 	runId += 1 -- все живые циклы увидят чужой id и завершатся
 	setNoClip(false)
+	stopAiming()
 end
 
 local function startRun(fn, force)
@@ -565,6 +649,7 @@ local function startRun(fn, force)
 	task.spawn(function()
 		local ok, err = pcall(fn, id)
 		setNoClip(false)
+		stopAiming()
 		isBusy = false
 		if not ok and isCurrent(id) then
 			setStatus("Ошибка: " .. tostring(err), THEME.btnStop)
