@@ -1,8 +1,10 @@
 -- Standalone LocalScript: Naramato Manager v2 (Strict Verified Pipe Damage Lock) - исправленная версия
 -- ФИКС УРОНА: телепорт теперь делается "рывком с паузой" (TELEPORT_PAUSE).
 -- Раньше CFrame писался 25 раз/сек — для сервера это непрерывные телепорты,
--- и урон по трубе валидировался через раз. Теперь: ТП -> пауза без касания
--- физики -> следующий ТП. Датчик урона, стабилизация и автоудар не менялись.
+-- и урон по трубе валидировался через раз. Теперь: ТП -> пауза -> следующий ТП.
+-- v2.1: в паузу позиция не трогается, но скорости обнуляются (персонаж не
+-- падает с ноклипом), а стрельба разрешена только в "чистом окне" после ТП
+-- (SHOOT_DELAY_AFTER_TP .. +SHOOT_WINDOW), когда сервер уже принял позицию.
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
@@ -16,7 +18,9 @@ local playerGui = player:WaitForChild("PlayerGui")
 local CONFIG = {
 	TELEPORT_HEIGHT_OFFSET = 0.5,  -- смещение по высоте у трубы
 	TP_LOOP_INTERVAL = 0.04,        -- частота проверки позиции/датчика (сек)
-	TELEPORT_PAUSE = 0.75,          -- ПАУЗА между повторными телепортами: в паузу физику не трогаем вообще
+	TELEPORT_PAUSE = 0.75,          -- ПАУЗА между повторными телепортами: в паузу позицию не трогаем
+	SHOOT_DELAY_AFTER_TP = 0.1,    -- задержка после телепорта перед выстрелом: сервер должен успеть принять позицию
+	SHOOT_WINDOW = 0.5,            -- сколько сек после телепорта разрешена стрельба (дальше ждем следующий ТП)
 	STABILIZE_TIME = 0.8,          -- сколько сек нужно простоять у новой трубы без отката до включения датчика
 	MAX_VALID_DIST = 4.5,          -- макс. радиус от трубы, внутри которого урон считается валидным
 	JIGGLE_RADIUS = 0.25,          -- микро-смещение для срабатывания серверного .Touched трубы
@@ -252,7 +256,7 @@ local function teleportUntilVerifiedDamage(pipe, updateStatus)
 			end
 
 			-- ТЕЛЕПОРТ С ПАУЗОЙ (главная часть фикса урона):
-			-- позицию пишем один раз, потом TELEPORT_PAUSE секунд физику НЕ трогаем —
+			-- позицию пишем один раз, потом TELEPORT_PAUSE секунд её не трогаем —
 			-- сервер видит спокойного игрока и валидирует урон по трубе
 			if tick() - lastTp >= CONFIG.TELEPORT_PAUSE then
 				lastTp = tick()
@@ -266,19 +270,23 @@ local function teleportUntilVerifiedDamage(pipe, updateStatus)
 				)
 
 				hrp.CFrame = CFrame.new(basePos + jiggleOffset)
-				hrp.AssemblyLinearVelocity = Vector3.zero
-				hrp.AssemblyAngularVelocity = Vector3.zero
-
-				-- выстрел сразу после установки позиции: сервер только что
-				-- получил нашу точную координату — лучший момент для попадания
-				lastHit = 0
+				lastHit = 0 -- первый выстрел этого цикла не должен сгореть из-за интервала
 			end
 
-			-- Автоудар инструментом
-			if tick() - lastHit >= CONFIG.HIT_INTERVAL then
-				lastHit = tick()
-				local tool = equipTool()
-				if tool then tool:Activate() end
+			-- В паузу позицию НЕ трогаем, но скорости обнуляем: с ноклипом
+			-- персонаж иначе медленно падает, и часть выстрелов уходит "в движении"
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+
+			-- Автоудар инструментом: только в "чистом" окне после телепорта —
+			-- не сразу (сервер должен принять новую позицию) и не в конце паузы
+			local sinceTp = tick() - lastTp
+			if sinceTp >= CONFIG.SHOOT_DELAY_AFTER_TP and sinceTp <= CONFIG.SHOOT_DELAY_AFTER_TP + CONFIG.SHOOT_WINDOW then
+				if tick() - lastHit >= CONFIG.HIT_INTERVAL then
+					lastHit = tick()
+					local tool = equipTool()
+					if tool then tool:Activate() end
+				end
 			end
 
 			task.wait(CONFIG.TP_LOOP_INTERVAL)
